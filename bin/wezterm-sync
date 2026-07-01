@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""wezterm-sync — build a custom wezterm from ONE canonical git ref and deploy it,
+natively, to every host that talks to the mux (server + mac + windows).
+
+Why this exists
+---------------
+We run a custom wezterm build on this Linux server (the mux host) and on the
+clients (m2book = macOS, desktop-win = Windows). The mux protocol only *hard*
+-rejects a connection when ``codec::CODEC_VERSION`` differs (it has been 45 for
+all our builds), but the behavioural fixes we carry (PaneFocused storm, resize
+dead-loop, focus-metadata) live in ``mux/`` + ``wezterm-client/``. So "keeping
+clients compatible" really means: **run the same commit everywhere.** Whenever
+the server's deployed binary drifts (as it did to 06c71b67), the clients fall
+behind. This script removes the drift by rebuilding all hosts from one ref.
+
+Binaries are NOT portable across os/arch (linux-x64 != macos-arm64 != win-x64),
+so we cannot copy one binary everywhere. Instead each host fetches the exact
+commit from origin and builds it *natively* over ssh, then we install into that
+platform's wezterm path (with a timestamped backup) and verify the version.
+
+Usage
+-----
+    wezterm-sync                      # dry-run: resolve ref, show plan, check reachability
+    wezterm-sync --apply              # actually build+deploy to all reachable hosts
+    wezterm-sync --ref main --apply   # pick the canonical ref (branch/tag/sha)
+    wezterm-sync --hosts server,m2book --apply
+    wezterm-sync --apply --restart-mux   # also restart the live server mux (ENDS live panes)
+
+Safe by default: dry-run unless --apply; never restarts the live mux unless
+--restart-mux; always backs up the binaries it replaces. Unreachable hosts are
+skipped and reported, never fatal.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+
+# --------------------------------------------------------------------------- #
+# Configuration                                                               #
+# --------------------------------------------------------------------------- #
+
+REPO = "/home/ankit/hroot/projects/external-repo/wezterm"   # canonical clone (this server)
+ORIGIN_URL = "git@github.com:ankitson/wezterm.git"          # the fork all hosts pull from
+DEFAULT_REF = "fix/panefocused-client-focus-metadata"       # blessed build: 06c71b67
+                                                              # deployed 2026-06-30 to server+m2book+desktop-win
+BUILD_CACHE = os.path.expanduser("~/.cache/wezterm-sync")   # server worktree + shared target
+
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=12"]
+
+
+@dataclass
+class Host:
+    name: str
+    kind: str                      # "local" | "ssh"
+    os: str                        # "linux" | "macos" | "windows"
+    repo: str                      # path to the wezterm clone on that host (git mode)
+    packages: list[str]            # cargo -p packages to build
+    binaries: dict[str, str]       # built-name -> absolute install destination (git mode)
+    ssh_alias: str | None = None   # ssh host alias (when kind == "ssh")
+    codesign: bool = False         # macOS: re-sign the bundle after swap
+    source_mode: str = "git"       # "git" (clone+checkout) | "tarball" (ship .tag source)
+    win_builds_dir: str = ""       # Windows: dir holding source + portable bundles
+    notes: str = ""                # operator caveats surfaced in the plan
+
+
+HOSTS: dict[str, Host] = {
+    # The mux host. Headless: only needs the CLI + mux-server. Build happens in
+    # an isolated worktree so the user's working branch is never touched.
+    "server": Host(
+        name="server",
+        kind="local",
+        os="linux",
+        repo=REPO,
+        packages=["wezterm", "wezterm-mux-server"],
+        binaries={
+            "wezterm": os.path.expanduser("~/.local/bin/vendor/wezterm"),
+            "wezterm-mux-server": os.path.expanduser("~/.local/bin/vendor/wezterm-mux-server"),
+        },
+    ),
+    # macOS client. Full GUI build, installed into the app bundle, then re-signed
+    # ad-hoc (matches the June 2026 deploy procedure).
+    "m2book": Host(
+        name="m2book",
+        kind="ssh",
+        ssh_alias="m2book",
+        os="macos",
+        repo="/Users/ankit/Documents/wezterm",
+        packages=["wezterm-gui", "wezterm", "wezterm-mux-server"],
+        binaries={
+            "wezterm-gui": "/Applications/WezTerm.app/Contents/MacOS/wezterm-gui",
+            "wezterm": "/Applications/WezTerm.app/Contents/MacOS/wezterm",
+            "wezterm-mux-server": "/Applications/WezTerm.app/Contents/MacOS/wezterm-mux-server",
+        },
+        codesign=True,
+        notes="GUI may stay running during swap; relaunch WezTerm.app afterwards to pick it up.",
+    ),
+    # Windows client. Builds from a shipped source tarball seeded with a .tag
+    # (no git clone — rustup shims + submodules are fragile under OpenSSH), using
+    # the toolchain recipe in bin/wezterm-build-windows.cmd, and produces a
+    # PORTABLE bundle under wezterm-builds that the user launches directly. The
+    # stock C:\Program Files\WezTerm install is left untouched.
+    "desktop-win": Host(
+        name="desktop-win",
+        kind="ssh",
+        ssh_alias="desktop-win",
+        os="windows",
+        repo="",
+        packages=["wezterm", "wezterm-gui", "wezterm-mux-server", "strip-ansi-escapes"],
+        binaries={},
+        source_mode="tarball",
+        win_builds_dir=r"C:\Users\ankit\wezterm-builds",
+        notes="Builds via bin/wezterm-build-windows.cmd into a portable "
+              r"WezTerm-windows-<tag>\ dir under wezterm-builds; launch wezterm-gui.exe "
+              "from there. Needs VS2022 Build Tools + Strawberry Perl + nightly-msvc "
+              "rustup toolchain on the host.",
+    ),
+}
+
+
+# --------------------------------------------------------------------------- #
+# Small shell helpers                                                         #
+# --------------------------------------------------------------------------- #
+
+class Step:
+    """One shell command to run on a host, with a human label."""
+
+    def __init__(self, label: str, argv: list[str]):
+        self.label = label
+        self.argv = argv
+
+
+def run(argv: list[str], *, check: bool = True, capture: bool = True,
+        env: dict | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
+    full_env = {**os.environ, **(env or {})}
+    return subprocess.run(
+        argv, check=check, env=full_env, timeout=timeout,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+        text=True,
+    )
+
+
+def ssh_argv(host: Host, remote_cmd: str) -> list[str]:
+    """Run a remote command as a single string; the remote's default shell
+    (zsh/bash on mac, cmd.exe on windows) parses it. Passing it as one argv
+    element keeps '&&' chains and quoted paths intact. cargo/git are already on
+    m2book's default ssh PATH, so no explicit login-shell wrapper is needed."""
+    assert host.ssh_alias
+    return [*SSH, host.ssh_alias, remote_cmd]
+
+
+def reachable(host: Host) -> bool:
+    if host.kind == "local":
+        return True
+    try:
+        cp = run([*SSH, host.ssh_alias, "echo ok"], check=False, timeout=15)
+        return cp.returncode == 0 and "ok" in (cp.stdout or "")
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Ref resolution                                                              #
+# --------------------------------------------------------------------------- #
+
+def resolve_ref(ref: str) -> tuple[str, str]:
+    """Return (sha, expected_version_string) for ``ref`` using the server clone.
+
+    wezterm's version string is ``<commitdate>-<HHMMSS>-<shorthash8>`` derived
+    from git at build time, so we can compute the exact string every host must
+    report once it builds this commit."""
+    sha = run(["git", "-C", REPO, "rev-parse", ref]).stdout.strip()
+    date = run(["git", "-C", REPO, "show", "-s", "--format=%cd",
+                "--date=format:%Y%m%d-%H%M%S", sha]).stdout.strip()
+    return sha, f"{date}-{sha[:8]}"
+
+
+# --------------------------------------------------------------------------- #
+# Per-host plans                                                              #
+# --------------------------------------------------------------------------- #
+
+def build_env(host: Host) -> dict:
+    if host.kind == "local":
+        return {"CARGO_TARGET_DIR": os.path.join(BUILD_CACHE, "target")}
+    return {}
+
+
+def worktree_dir() -> str:
+    return os.path.join(BUILD_CACHE, "worktree")
+
+
+def local_worktree_step(sha: str, tag: str) -> Step:
+    """Isolated worktree at the sha (working branch untouched) + submodules + .tag."""
+    wt = worktree_dir()
+    # touch build.rs so cargo re-runs wezterm-version/build.rs and re-reads .tag
+    # (it registers rerun-if-changed on the HEAD *ref*, which a detached checkout
+    # or shared target dir can leave unchanged -> stale WEZTERM_CI_TAG).
+    cmd = (
+        f"git -C {REPO} fetch origin --tags --prune && "
+        f"mkdir -p {BUILD_CACHE} && "
+        f"(git -C {REPO} worktree add --force --detach {wt} {sha} "
+        f"  || (cd {wt} && git checkout --detach {sha})) && "
+        f"git -C {wt} submodule update --init --recursive && "
+        f"printf '%s\\n' {tag} > {wt}/.tag && touch {wt}/wezterm-version/build.rs"
+    )
+    return Step("source: worktree @ sha + submodules + .tag", ["bash", "-lc", cmd])
+
+
+def source_steps(host: Host, sha: str, tag: str) -> list[Step]:
+    """Fetch origin, check out the exact commit, sync submodules (git mode)."""
+    if host.kind == "local":
+        return [local_worktree_step(sha, tag)]
+    # macOS ssh (git mode). Fetch the exact commit from the FORK by URL — the
+    # host's `origin` may point at upstream (m2book does), which lacks our
+    # custom commits. GitHub serves reachable shas via fetch-by-sha.
+    repo = host.repo
+    # Seed .tag = expected version. wezterm-version/build.rs only re-embeds the
+    # version when .tag changes, so without this an incremental build over a warm
+    # target/ keeps the OLD version string even though the code recompiled.
+    cmd = (
+        f"git -C {repo} fetch {ORIGIN_URL} {sha} && "
+        f"git -C {repo} checkout --force --detach {sha} && "
+        f"git -C {repo} submodule update --init --recursive && "
+        f"printf '%s\\n' {tag} > {repo}/.tag && touch {repo}/wezterm-version/build.rs"
+    )
+    return [Step("source: fetch fork sha + submodules + .tag", ssh_argv(host, cmd))]
+
+
+def windows_plan(host: Host, sha: str, tag: str) -> list[Step]:
+    """Server builds a .tag-seeded source tarball, ships it + the build script,
+    then builds the portable bundle on the host via wezterm-build-windows.cmd."""
+    short = sha[:8]
+    wt = worktree_dir()
+    tarball = os.path.join(BUILD_CACHE, f"wezterm-win-src-{short}.tar.gz")
+    srcname = f"wezterm-win-src-{short}"
+    builds = host.win_builds_dir
+    win_src = f"{builds}\\{srcname}"
+    out_dir = f"{builds}\\WezTerm-windows-{tag}"
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wezterm-build-windows.cmd")
+    alias = host.ssh_alias
+    # forward-slash form for scp destinations on Windows OpenSSH
+    builds_fwd = builds.replace("\\", "/")
+
+    steps = [local_worktree_step(sha, tag)]
+    # Pack the worktree source (incl. submodules + .tag) excluding any build dir.
+    steps.append(Step(
+        f"package: source tarball {srcname}.tar.gz",
+        ["bash", "-lc",
+         f"tar -C {os.path.dirname(wt)} --exclude target -czf {tarball} "
+         f"--transform 's,^{os.path.basename(wt)},{srcname},' {os.path.basename(wt)}"]))
+    steps.append(Step(f"ensure: {builds} exists",
+                      ssh_argv(host, f'if not exist "{builds}" mkdir "{builds}"')))
+    # No shell here (subprocess list), so the scp dest must NOT be quoted.
+    steps.append(Step("copy: source tarball -> host",
+                      ["scp", *SSH[1:], tarball, f"{alias}:{builds_fwd}/"]))
+    steps.append(Step("copy: build script -> host",
+                      ["scp", *SSH[1:], script, f"{alias}:{builds_fwd}/"]))
+    steps.append(Step(f"extract: {srcname}",
+                      ssh_argv(host, f'cd /d "{builds}" && (rmdir /s /q "{srcname}" 2>nul & '
+                                     f'tar -xzf "{srcname}.tar.gz")')))
+    # Invoke the batch directly (paths are space-free, so no cmd /c "" wrapper —
+    # that wrapper leaves a stray quote in %1 and corrupts the copy paths). The
+    # cd anchors a valid cwd (fresh ssh sessions otherwise error "cannot find
+    # the path specified").
+    steps.append(Step("build+package: wezterm-build-windows.cmd (~10-15 min)",
+                      ssh_argv(host, f'cd /d %USERPROFILE% && '
+                                     f'{builds}\\wezterm-build-windows.cmd {win_src} {tag}')))
+    steps.append(Step(f"verify: {out_dir}\\wezterm.exe --version",
+                      ssh_argv(host, f'cd /d %USERPROFILE% && "{out_dir}\\wezterm.exe" --version')))
+    return steps
+
+
+def build_steps(host: Host) -> list[Step]:
+    pkgs = " ".join(f"-p {p}" for p in host.packages)
+    if host.kind == "local":
+        wt = worktree_dir()
+        return [Step(f"build: cargo build --release {pkgs}",
+                     ["bash", "-lc", f"cd {wt} && cargo build --release {pkgs}"])]
+    # macOS ssh
+    cmd = f"cd {host.repo} && cargo build --release {pkgs}"
+    return [Step(f"build: cargo build --release {pkgs}", ssh_argv(host, cmd))]
+
+
+def install_steps(host: Host) -> list[Step]:
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    steps: list[Step] = []
+
+    if host.kind == "local":
+        rel = os.path.join(BUILD_CACHE, "target", "release")
+        for built, dest in host.binaries.items():
+            bak = f"{dest}.bak-{ts}"
+            cmd = (f'test -f "{dest}" && cp -p "{dest}" "{bak}"; '
+                   f'install -m755 "{os.path.join(rel, built)}" "{dest}"')
+            steps.append(Step(f"install: {built} -> {dest} (backup {os.path.basename(bak)})",
+                              ["bash", "-lc", cmd]))
+        # The SSHMUX proxy command clients run over ssh is a NON-interactive,
+        # non-login exec, so ~/.bashrc's `case $- ... *) return;;` guard skips
+        # the PATH= line that adds ~/.local/bin/vendor — plain `ssh host
+        # 'wezterm ...'` would otherwise hit a bare system PATH with no wezterm
+        # at all (see docs/NOTES.md 2026-06-30). /usr/local/bin is on every
+        # default PATH, so symlink there. Best-effort: `sudo -n` never prompts,
+        # so this silently no-ops if passwordless sudo isn't configured.
+        for built, dest in host.binaries.items():
+            steps.append(Step(f"ensure: /usr/local/bin/{built} -> vendor (SSHMUX proxy PATH)",
+                              ["bash", "-lc",
+                               f'sudo -n ln -sf "{dest}" "/usr/local/bin/{built}" 2>/dev/null || true']))
+        return steps
+
+    # macOS
+    rel = f"{host.repo}/target/release"
+    for built, dest in host.binaries.items():
+        bak = f"{dest}.bak-{ts}"
+        cmd = (f'test -f "{dest}" && cp -p "{dest}" "{bak}"; '
+               f'cp -f "{rel}/{built}" "{dest}"')
+        steps.append(Step(f"install: {built} -> {dest}", ssh_argv(host, cmd)))
+    if host.codesign:
+        bundle = "/Applications/WezTerm.app"
+        cmd = (f'codesign --remove-signature "{bundle}" 2>/dev/null; '
+               f'codesign --force --deep --sign - "{bundle}"')
+        steps.append(Step("codesign: ad-hoc re-sign bundle", ssh_argv(host, cmd)))
+    return steps
+
+
+def verify_steps(host: Host) -> list[Step]:
+    # Pick a stable binary to interrogate (prefer the CLI).
+    target = None
+    for name, dest in host.binaries.items():
+        if name == "wezterm":
+            target = dest
+            break
+    target = target or next(iter(host.binaries.values()))
+    runner = (["bash", "-lc", f'"{target}" --version'] if host.kind == "local"
+              else ssh_argv(host, f'"{target}" --version'))
+    return [Step(f"verify: {target} --version", runner)]
+
+
+def host_plan(host: Host, sha: str, tag: str) -> list[Step]:
+    if host.source_mode == "tarball" and host.os == "windows":
+        return windows_plan(host, sha, tag)
+    return (source_steps(host, sha, tag) + build_steps(host)
+            + install_steps(host) + verify_steps(host))
+
+
+# --------------------------------------------------------------------------- #
+# Execution                                                                   #
+# --------------------------------------------------------------------------- #
+
+def execute_host(host: Host, sha: str, expected: str, apply: bool) -> dict:
+    result = {"host": host.name, "status": "ok" if apply else "planned",
+              "version": None, "detail": ""}
+    env = build_env(host)
+    for step in host_plan(host, sha, expected):
+        print(f"  [{host.name}] {step.label}")
+        if not apply:
+            print(f"      $ {' '.join(step.argv)}")
+            continue
+        try:
+            timeout = 3600 if step.label.startswith("build") else 300
+            cp = run(step.argv, check=False, env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            result.update(status="fail", detail=f"timeout in: {step.label}")
+            return result
+        out = (cp.stdout or "").strip()
+        if step.label.startswith("verify"):
+            result["version"] = out.splitlines()[-1] if out else ""
+            ok = sha[:8] in out
+            result["status"] = "ok" if ok else "version-mismatch"
+            if not ok:
+                result["detail"] = f"expected {expected}, got {out!r}"
+        elif cp.returncode != 0:
+            result.update(status="fail", detail=f"{step.label}: {out[-400:]}")
+            return result
+    return result
+
+
+# wezterm-mux-server has no daily-restart mechanism of its own: every SSHMUX
+# client connection that can't reach the socket auto-spawns it fresh
+# (config/src/unix.rs serve_command = "<dir of current_exe>/wezterm-mux-server
+# --daemonize"), and it inherits WHATEVER environment spawned it, forever —
+# every pane it ever creates inherits that same environment. On 2026-06-30 a
+# daemon got started from inside a Claude Code agent shell and inherited
+# NO_COLOR=1 from it, silently killing color output (eza, ls, etc.) in every
+# pane for days, even though a genuine fresh SSH session is clean. `env -u`
+# these here so this tool can NEVER reproduce that, regardless of which shell
+# invokes --restart-mux.
+_AGENT_ENV_TO_STRIP = ["NO_COLOR", "CLICOLOR_FORCE"]
+
+
+def restart_mux(apply: bool):
+    """Restart the live server mux on its socket (ENDS existing panes)."""
+    mux = os.path.expanduser("~/.local/bin/vendor/wezterm-mux-server")
+    strip = " ".join(f"-u {v}" for v in _AGENT_ENV_TO_STRIP)
+    print("  [server] restart: kill + relaunch wezterm-mux-server (ENDS live panes; env sanitized)")
+    if not apply:
+        print(f"      $ pkill -x wezterm-mux-server; env {strip} {mux} --daemonize")
+        return
+    run(["bash", "-lc", "pkill -x wezterm-mux-server || true"], check=False)
+    time.sleep(1)
+    run(["env", *strip.split(), mux, "--daemonize"], check=False)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Build wezterm from one ref and deploy to all hosts.")
+    ap.add_argument("--ref", default=DEFAULT_REF, help=f"canonical git ref (default: {DEFAULT_REF})")
+    ap.add_argument("--hosts", default="", help="comma list to limit (default: all)")
+    ap.add_argument("--apply", action="store_true", help="actually build+deploy (default: dry-run)")
+    ap.add_argument("--restart-mux", action="store_true", help="restart the live server mux after deploy")
+    args = ap.parse_args()
+
+    selected = [h.strip() for h in args.hosts.split(",") if h.strip()] or list(HOSTS)
+    unknown = [h for h in selected if h not in HOSTS]
+    if unknown:
+        print(f"unknown host(s): {', '.join(unknown)}; known: {', '.join(HOSTS)}", file=sys.stderr)
+        return 2
+
+    sha, expected = resolve_ref(args.ref)
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    print(f"== wezterm-sync [{mode}] ==")
+    print(f"   ref       : {args.ref}")
+    print(f"   commit    : {sha}")
+    print(f"   version   : {expected}")
+    print(f"   hosts     : {', '.join(selected)}")
+    print()
+
+    results = []
+    for name in selected:
+        host = HOSTS[name]
+        print(f"-- {name} ({host.os}) --")
+        if host.notes:
+            print(f"   note: {host.notes}")
+        if not reachable(host):
+            print(f"   UNREACHABLE — skipping\n")
+            results.append({"host": name, "status": "unreachable", "version": None, "detail": ""})
+            continue
+        results.append(execute_host(host, sha, expected, args.apply))
+        print()
+
+    if args.restart_mux and "server" in selected:
+        restart_mux(args.apply)
+        print()
+
+    print("== summary ==")
+    print(f"   target version: {expected}")
+    for r in results:
+        line = f"   {r['host']:<12} {r['status']:<16} {r.get('version') or ''}"
+        if r.get("detail"):
+            line += f"  ({r['detail']})"
+        print(line)
+
+    if not args.apply:
+        print("\n   dry-run only. re-run with --apply to build+deploy.")
+        return 0
+    bad = [r for r in results if r["status"] not in ("ok", "unreachable")]
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

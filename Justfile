@@ -45,6 +45,14 @@ network-listeners *args:
 wezterm-win-trace *args:
   @bin/wezterm-win-trace {{args}}
 
+# Show the build+deploy plan for keeping every host on one wezterm commit (dry-run).
+wezterm-sync *args:
+  @bin/wezterm-sync {{args}}
+
+# Build the canonical ref and deploy to every reachable host (server + mac + windows).
+wezterm-sync-apply ref="main" *args:
+  @bin/wezterm-sync --ref {{ref}} --apply {{args}}
+
 # Kept as a short alias for interactive use.
 list: skills-list
 
