@@ -7,6 +7,7 @@ description: Maintain project docs and work logs using the repo's standard rever
 
 Follow these conventions whenever doing non-trivial work in a project.
 Do not document small changes related to temporary uncommitted work.
+Document work ONLY after finishing and testing a full block of work, not partway.
 
 ## Required Structure
 
@@ -39,3 +40,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:
 ## logs/
 
 Store script and service output here. Prefer JSONL structured logging. Use descriptive filenames.
+
+## Justfile
+
+do not bloat a justfile with too many commands. prefer to extend an existing command where possible
