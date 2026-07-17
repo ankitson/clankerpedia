@@ -18,6 +18,10 @@ path = ".agents/skills/autoresearch"
 repo = "openclaw/agent-skills"
 path = "skills/autoreview"
 
+[skills.bird]
+repo = "windhood-jza/openclaw-bird-skill"
+ref = "master"
+
 [skills.browser-web-search]
 repo = "ogulcancelik/agent-skills"
 path = "skills/web-search"
