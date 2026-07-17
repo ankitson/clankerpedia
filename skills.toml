@@ -34,6 +34,11 @@ path = "skills/qmd"
 repo = "public-clis/rdt-cli"
 files = ["SKILL.md", "SCHEMA.md"]
 
+[skills.web-search]
+repo = "ogulcancelik/agent-skills"
+path = "skills/web-search"
+fork = true
+
 [skills.webby]
 repo = "ankitson/webby"
 

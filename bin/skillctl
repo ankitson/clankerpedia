@@ -414,7 +414,7 @@ class SkillManager:
             return [str(exc)]
         if not isinstance(source, dict):
             return [f"{name}: source must be a TOML table"]
-        allowed = {"repo", "ref", "path", "files"}
+        allowed = {"repo", "ref", "path", "files", "fork"}
         unknown = sorted(set(source) - allowed)
         if unknown:
             errors.append(f"{name}: unknown keys: {', '.join(unknown)}")
@@ -583,6 +583,9 @@ class SkillManager:
         print(f"synced {name}: {revision[:12]}")
 
     def sync_one(self, name: str, source: dict[str, Any]) -> None:
+        if source.get("fork", False):
+            print(f"skipping {name}: fork=true (local changes preserved)")
+            return
         if _is_glob(source.get("path", "")):
             self._sync_glob(name, source)
         else:
