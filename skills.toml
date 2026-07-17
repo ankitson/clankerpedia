@@ -18,6 +18,10 @@ path = ".agents/skills/autoresearch"
 repo = "openclaw/agent-skills"
 path = "skills/autoreview"
 
+[skills.browser-web-search]
+repo = "ogulcancelik/agent-skills"
+path = "skills/web-search"
+
 [skills.job-search]
 repo = "ssh://git@git.home.ankitson.com:1024/ankitson/job-search.git"
 path = "skills/job-search"
@@ -38,10 +42,9 @@ path = "skills/qmd"
 repo = "public-clis/rdt-cli"
 files = ["SKILL.md", "SCHEMA.md"]
 
-[skills.web-search]
-repo = "ogulcancelik/agent-skills"
-path = "skills/web-search"
-fork = true
+[skills.searxng]
+repo = "abk234/searxng-skill"
+path = "skills/searxng"
 
 [skills.webby]
 repo = "ankitson/webby"

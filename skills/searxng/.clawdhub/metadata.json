@@ -1,0 +1,33 @@
+{
+  "name": "searxng",
+  "version": "1.0.3",
+  "description": "Privacy-respecting metasearch using your local SearXNG instance",
+  "author": "Avinash Venkatswamy",
+  "license": "MIT",
+  "tags": ["search", "privacy", "web", "searxng", "metasearch", "self-hosted"],
+  "homepage": "https://searxng.org",
+  "repository": "https://github.com/abk234/searxng-skill",
+  "keywords": ["privacy", "search", "metasearch", "local", "self-hosted"],
+  "requires": {
+    "bins": ["python3"]
+  },
+  "config": {
+    "env": {
+      "SEARXNG_URL": {
+        "description": "SearXNG instance URL (required for your setup)",
+        "default": "http://localhost:8080",
+        "required": true
+      }
+    }
+  },
+  "prerequisites": {
+    "external": [
+      {
+        "name": "SearXNG",
+        "description": "A running SearXNG instance (local or remote)",
+        "homepage": "https://searxng.org",
+        "installation": "https://docs.searxng.org/admin/installation.html"
+      }
+    ]
+  }
+}
