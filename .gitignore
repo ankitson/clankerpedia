@@ -10,3 +10,6 @@ agent-scripts/
 
 # Personal ADHD coaching profile — never publish
 skills/adhd/references/profile.md
+
+# 105 MB compiled fmcal binary — build/fetch locally
+bin/fmcal.bin

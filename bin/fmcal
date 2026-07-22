@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# fmcal wrapper — reads Fastmail CalDAV credentials from 1Password.
+set -euo pipefail
+
+export FMCAL_USERNAME="ankitson@fastmail.com"
+export FMCAL_PASSWORD="$(op read 'op://clankers/fastmail/add more/dev')"
+
+exec /home/ankit/toolbox/bin/fmcal.bin "$@"

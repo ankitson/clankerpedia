@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# fastmail-cli wrapper — reads Fastmail credentials from 1Password.
+set -euo pipefail
+
+# The dev-mcp-ro token from 1Password is a Fastmail API token (fmu1-...)
+# that works with JMAP. The username + app password works with CalDAV.
+export FASTMAIL_API_TOKEN="$(op read 'op://clankers/fastmail/add more/dev-mcp-ro')"
+export FASTMAIL_USERNAME="ankitson@fastmail.com"
+export FASTMAIL_APP_PASSWORD="$(op read 'op://clankers/fastmail/add more/dev')"
+
+exec /projects/external-repo/fastmail-cli/target/debug/fastmail-cli "$@"

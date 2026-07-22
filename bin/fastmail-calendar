@@ -1,0 +1,338 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = ["httpx", "python-dateutil"]
+# ///
+"""
+fastmail-calendar — List Fastmail calendar events for a given day.
+
+Usage:
+  fastmail-calendar               # today
+  fastmail-calendar 2026-07-22    # specific day
+  fastmail-calendar "next monday" # any dateutil-parsable string
+
+Shows events from the "Main" calendar group.
+Uses the 1Password entry op://clankers/fastmail/add more/dev for auth.
+"""
+
+import sys
+import subprocess
+import json
+from datetime import datetime, date, timezone, timedelta
+from dateutil.parser import parse as dateparse
+from dateutil.tz import gettz
+import httpx
+
+FASTMAIL_USER = "ankitson@fastmail.com"
+OP_REF = "op://clankers/fastmail/add more/dev"
+CALENDAR_GROUP_NAME = "Main"
+JMAP_CORE = "urn:ietf:params:jmap:core"
+JMAP_CAL = "urn:ietf:params:jmap:calendars"
+
+RED = "\033[91m"
+YELLOW = "\033[93m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+
+def die(msg: str):
+    print(f"{RED}error:{RESET} {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def get_app_password() -> str:
+    """Read the Fastmail dev app password from 1Password."""
+    try:
+        r = subprocess.run(
+            ["op", "read", OP_REF],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        die(f"Failed to read 1Password entry {OP_REF}: {e.stderr.strip()}")
+    except FileNotFoundError:
+        die("1Password CLI (`op`) not found — is it installed and configured?")
+    pw = r.stdout.strip()
+    if not pw:
+        die(f"1Password entry {OP_REF} returned an empty value")
+    return pw
+
+
+def parse_date_arg(arg: str | None) -> tuple[datetime, datetime]:
+    """Parse date argument. Returns (local_midnight, next_local_midnight)."""
+    local_tz = gettz() or timezone.utc  # system local timezone
+    if arg is None:
+        # today in local tz
+        now = datetime.now(local_tz)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        try:
+            dt = dateparse(arg)
+        except (ValueError, TypeError):
+            die(f"Could not parse date: {arg!r}")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=local_tz)
+        day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    return day_start, day_end
+
+
+def fmt_ts(ts: str | None, show_time: bool = True) -> str:
+    """Format an ISO timestamp or date for display."""
+    if not ts:
+        return "???"
+    if show_time:
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            return ts
+        return dt.strftime("%H:%M")
+    # all-day: just date
+    try:
+        d = date.fromisoformat(ts[:10])
+    except ValueError:
+        return ts
+    return d.strftime("%a %b %d")
+
+
+def fmt_duration(dur_iso: str | None) -> str:
+    """Format an ISO 8601 duration string in a human-friendly way."""
+    if not dur_iso:
+        return ""
+    if dur_iso.startswith("PT"):
+        # PT1H30M → 1h30m
+        rest = dur_iso[2:]
+        h = m = 0
+        h_idx = rest.find("H")
+        m_idx = rest.find("M")
+        if h_idx >= 0:
+            h = int(rest[:h_idx])
+            rest = rest[h_idx + 1 :]
+        if m_idx >= 0:
+            m_str = rest[:m_idx]
+            m = int(m_str) if m_str else 0
+        parts = []
+        if h:
+            parts.append(f"{h}h")
+        if m:
+            parts.append(f"{m}m")
+        return " (" + "".join(parts) + ")" if parts else ""
+    if dur_iso.startswith("P"):
+        # P1D etc.
+        rest = dur_iso[1:]
+        d_idx = rest.find("D")
+        if d_idx >= 0:
+            d = int(rest[:d_idx])
+            return " (all day)" if d >= 1 else ""
+    return ""
+
+
+def main():
+    # --- Parse args ---
+    date_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    if date_arg and date_arg in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0)
+
+    day_start, day_end = parse_date_arg(date_arg)
+    day_start_utc = day_start.astimezone(timezone.utc)
+    day_end_utc = day_end.astimezone(timezone.utc)
+
+    prefix = f"[{day_start.strftime('%a %b %d %Y')}]"
+    print(f"{BOLD}{prefix}{RESET}\n")
+
+    # --- Authenticate ---
+    app_password = get_app_password()
+    auth = (FASTMAIL_USER, app_password)
+
+    # --- Get JMAP session ---
+    try:
+        r = httpx.get(
+            "https://api.fastmail.com/jmap/session",
+            auth=auth,
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+    except httpx.RequestError as e:
+        die(f"Network error contacting Fastmail session endpoint: {e}")
+    if r.status_code == 401:
+        die("Authentication failed — check that the Fastmail app password is correct")
+    if r.status_code != 200:
+        die(f"Fastmail session endpoint returned HTTP {r.status_code}: {r.text[:200]}")
+    session = r.json()
+
+    api_url = session.get("apiUrl")
+    if not api_url:
+        die("No apiUrl in Fastmail session response")
+
+    accounts = session.get("accounts", {})
+    if not accounts:
+        die("No accounts in Fastmail session response")
+    account_id = next(iter(accounts.keys()))
+    account_name = accounts[account_id].get("name", account_id)
+
+    print(f"{DIM}Account: {account_name}{RESET}\n")
+
+    # --- Discover calendars ---
+    request_body = {
+        "using": [JMAP_CORE, JMAP_CAL],
+        "methodCalls": [
+            ["CalendarGroup/get", {"accountId": account_id}, "g0"],
+            ["Calendar/get", {"accountId": account_id}, "c0"],
+        ],
+    }
+
+    try:
+        r = httpx.post(
+            api_url,
+            auth=auth,
+            json=request_body,
+            headers={"Accept": "application/json"},
+            timeout=20,
+        )
+    except httpx.RequestError as e:
+        die(f"Network error querying calendars: {e}")
+    if r.status_code != 200:
+        die(f"JMAP request failed (HTTP {r.status_code}): {r.text[:300]}")
+    resp = r.json()
+
+    # Parse responses
+    groups_data = None
+    cal_data = None
+    for method_resp in resp.get("methodResponses", []):
+        name = method_resp[0] if isinstance(method_resp, list) else None
+        data = method_resp[1] if isinstance(method_resp, list) and len(method_resp) > 1 else {}
+        if name == "CalendarGroup/get":
+            groups_data = data
+        elif name == "Calendar/get":
+            cal_data = data
+
+    if not groups_data or not cal_data:
+        die("Failed to get calendar data from Fastmail API")
+
+    # Find the "Main" calendar group
+    groups = groups_data.get("list", [])
+    main_group = None
+    for g in groups:
+        if g.get("name") == CALENDAR_GROUP_NAME:
+            main_group = g
+            break
+    if not main_group:
+        available = [g.get("name", "(unnamed)") for g in groups]
+        die(
+            f'Calendar group "{CALENDAR_GROUP_NAME}" not found. '
+            f"Available groups: {', '.join(available)}"
+        )
+    main_group_id = main_group["id"]
+
+    # Filter calendars to the Main group
+    all_cals = cal_data.get("list", [])
+    main_cals = [c for c in all_cals if c.get("groupId") == main_group_id]
+    if not main_cals:
+        die(f'No calendars found in group "{CALENDAR_GROUP_NAME}"')
+
+    cal_ids = [c["id"] for c in main_cals]
+
+    # --- Query events for the day ---
+    after_iso = day_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    before_iso = day_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    query_request = {
+        "using": [JMAP_CORE, JMAP_CAL],
+        "methodCalls": [
+            [
+                "CalendarEvent/query",
+                {
+                    "accountId": account_id,
+                    "filter": {
+                        "after": after_iso,
+                        "before": before_iso,
+                        "calendarIds": cal_ids,
+                    },
+                },
+                "q0",
+            ],
+            [
+                "CalendarEvent/get",
+                {
+                    "accountId": account_id,
+                    "#ids": {"name": "CalendarEvent/query", "path": "/ids"},
+                    "properties": [
+                        "title",
+                        "start",
+                        "duration",
+                        "description",
+                        "calendarId",
+                        "showWithoutTime",
+                        "status",
+                        "location",
+                    ],
+                },
+                "e0",
+            ],
+        ],
+    }
+
+    try:
+        r = httpx.post(
+            api_url,
+            auth=auth,
+            json=query_request,
+            headers={"Accept": "application/json"},
+            timeout=20,
+        )
+    except httpx.RequestError as e:
+        die(f"Network error querying events: {e}")
+    if r.status_code != 200:
+        die(f"Event query failed (HTTP {r.status_code}): {r.text[:300]}")
+    event_resp = r.json()
+
+    events = None
+    for method_resp in event_resp.get("methodResponses", []):
+        name = method_resp[0] if isinstance(method_resp, list) else None
+        data = method_resp[1] if isinstance(method_resp, list) and len(method_resp) > 1 else {}
+        if name == "CalendarEvent/get":
+            events = data
+
+    if events is None:
+        die("No event data in response")
+
+    event_list = events.get("list", [])
+    # Build a calendar-id → name lookup
+    cal_name_map = {c["id"]: c.get("name", c["id"]) for c in all_cals}
+
+    if not event_list:
+        print(f"  {DIM}(no events){RESET}")
+        sys.exit(0)
+
+    # Sort events by start time
+    event_list.sort(key=lambda e: e.get("start") or "")
+
+    for ev in event_list:
+        title = ev.get("title") or "(untitled)"
+        start = ev.get("start", "")
+        duration = ev.get("duration")
+        show_no_time = ev.get("showWithoutTime", False)
+        location = ev.get("location") or ""
+        cal_name = cal_name_map.get(ev.get("calendarId", ""), "")
+
+        # Time string
+        if show_no_time:
+            time_str = f"{DIM}all day{RESET}"
+        else:
+            time_str = fmt_ts(start, show_time=True)
+
+        dur_str = fmt_duration(duration)
+
+        # Calendar badge
+        cal_badge = f"{DIM}[{cal_name}]{RESET}" if cal_name else ""
+
+        location_part = f"  {DIM}📍 {location}{RESET}" if location else ""
+
+        print(f"  {CYAN}{time_str}{RESET}{dur_str}  {BOLD}{title}{RESET}  {cal_badge}{location_part}")
+
+    print()  # trailing newline
+
+
+if __name__ == "__main__":
+    main()
