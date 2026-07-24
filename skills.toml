@@ -53,6 +53,9 @@ path = "skills/searxng"
 [skills.webby]
 repo = "ankitson/webby"
 
+[skills.write-discoverable-code]
+repo = "https://github.com/modem-dev/skills"
+
 [routers.agent-workflows]
 title = "Agent Workflows"
 description = "Skills for structured agent collaboration workflows: planning grill sessions, documentation-backed grilling, issue triage, and zooming out for broader context."
