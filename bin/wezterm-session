@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Save and recreate the currently open WezTerm layout.
+
+Backups contain windows, tabs, split panes, their working directories and tab
+titles.  They deliberately do not record commands or pane contents: neither
+can be safely resumed after a reboot.  Restoring starts a fresh login shell in
+each remembered directory.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_BACKUP_DIR = Path.home() / ".local" / "share" / "wezterm-session-backups"
+DEFAULT_KEEP = 4
+
+
+class WezTermError(RuntimeError):
+    pass
+
+
+def wezterm_command(*args: str, no_auto_start: bool = False) -> list[str]:
+    command = [os.environ.get("WEZTERM_BIN", "wezterm"), "cli"]
+    if no_auto_start:
+        command.append("--no-auto-start")
+    return [*command, *args]
+
+
+def run_wezterm(*args: str, no_auto_start: bool = False) -> str:
+    result = subprocess.run(
+        wezterm_command(*args, no_auto_start=no_auto_start),
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        message = result.stderr.strip() or result.stdout.strip() or "unknown WezTerm error"
+        raise WezTermError(message)
+    return result.stdout.strip()
+
+
+def fetch_panes(*, no_auto_start: bool) -> list[dict[str, Any]]:
+    raw = run_wezterm("list", "--format", "json", no_auto_start=no_auto_start)
+    panes = json.loads(raw)
+    if not isinstance(panes, list):
+        raise WezTermError("WezTerm returned an unexpected pane list")
+    return panes
+
+
+def backup_path(backup_dir: Path) -> Path:
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return backup_dir / f"wezterm-session-{timestamp}.json"
+
+
+def create_backup(backup_dir: Path, keep: int) -> int:
+    try:
+        panes = fetch_panes(no_auto_start=True)
+    except (WezTermError, json.JSONDecodeError) as error:
+        print(f"wezterm-session: no running WezTerm mux; backup skipped ({error})", file=sys.stderr)
+        return 0
+
+    if not panes:
+        print("wezterm-session: no panes to back up; backup skipped", file=sys.stderr)
+        return 0
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "created_at": datetime.now(UTC).isoformat(),
+        "host": os.uname().nodename,
+        "wezterm_version": subprocess.run(
+            [os.environ.get("WEZTERM_BIN", "wezterm"), "--version"],
+            text=True, capture_output=True, check=False,
+        ).stdout.strip(),
+        "panes": panes,
+    }
+    destination = backup_path(backup_dir)
+    with tempfile.NamedTemporaryFile("w", dir=backup_dir, delete=False, encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    temporary.replace(destination)
+
+    snapshots = sorted(backup_dir.glob("wezterm-session-*.json"), reverse=True)
+    for old_snapshot in snapshots[keep:]:
+        old_snapshot.unlink()
+    print(f"saved {len(panes)} panes to {destination}")
+    return 0
+
+
+def load_snapshot(path: str | None, backup_dir: Path) -> tuple[Path, list[dict[str, Any]]]:
+    if path:
+        snapshot = Path(path).expanduser()
+    else:
+        snapshots = sorted(backup_dir.glob("wezterm-session-*.json"), reverse=True)
+        if not snapshots:
+            raise WezTermError(f"no backups found in {backup_dir}")
+        snapshot = snapshots[0]
+    with snapshot.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("format_version") != 1 or not isinstance(payload.get("panes"), list):
+        raise WezTermError(f"{snapshot} is not a wezterm-session backup")
+    return snapshot, payload["panes"]
+
+
+def pane_cwd(pane: dict[str, Any]) -> str:
+    cwd = pane.get("cwd_path")
+    if isinstance(cwd, str) and cwd and Path(cwd).is_dir():
+        return cwd
+    return str(Path.home())
+
+
+def pane_area(pane: dict[str, Any]) -> int:
+    size = pane.get("size") or {}
+    return int(size.get("cols", 1)) * int(size.get("rows", 1))
+
+
+def find_split_parent(new_pane: dict[str, Any], created: list[tuple[dict[str, Any], str]]) -> tuple[str, int] | None:
+    """Choose a touching, already-created pane and the least-surprising split."""
+    new_left, new_top = int(new_pane.get("left_col", 0)), int(new_pane.get("top_row", 0))
+    new_size = new_pane.get("size") or {}
+    new_right = new_left + int(new_size.get("cols", 1))
+    new_bottom = new_top + int(new_size.get("rows", 1))
+    candidates: list[tuple[int, str, int]] = []
+    for old_pane, pane_id in created:
+        old_left, old_top = int(old_pane.get("left_col", 0)), int(old_pane.get("top_row", 0))
+        old_size = old_pane.get("size") or {}
+        old_right = old_left + int(old_size.get("cols", 1))
+        old_bottom = old_top + int(old_size.get("rows", 1))
+        if old_right == new_left:
+            overlap = max(0, min(old_bottom, new_bottom) - max(old_top, new_top))
+            if overlap:
+                candidates.append((overlap, "right", int(pane_id)))
+        if old_bottom == new_top:
+            overlap = max(0, min(old_right, new_right) - max(old_left, new_left))
+            if overlap:
+                candidates.append((overlap, "bottom", int(pane_id)))
+    if not candidates:
+        return None
+    _overlap, direction, pane_id = max(candidates)
+    return direction, pane_id
+
+
+def split_percent(new_pane: dict[str, Any], parent_pane: dict[str, Any], direction: str) -> int:
+    key = "cols" if direction == "right" else "rows"
+    new_size = int((new_pane.get("size") or {}).get(key, 1))
+    old_size = int((parent_pane.get("size") or {}).get(key, 1))
+    return max(10, min(90, round(100 * new_size / max(1, new_size + old_size))))
+
+
+def restore_snapshot(snapshot: Path, panes: list[dict[str, Any]], dry_run: bool) -> int:
+    if not panes:
+        raise WezTermError("backup contains no panes")
+    if not dry_run:
+        # Fail up front with a clear error instead of creating part of a layout.
+        fetch_panes(no_auto_start=False)
+
+    windows: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for pane in panes:
+        windows[int(pane["window_id"])].append(pane)
+    plan = []
+    for old_window_id in sorted(windows):
+        tabs: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for pane in windows[old_window_id]:
+            tabs[int(pane["tab_id"])].append(pane)
+        plan.append((old_window_id, tabs))
+
+    if dry_run:
+        print(f"would restore {len(windows)} windows / {len(panes)} panes from {snapshot}")
+        for old_window_id, tabs in plan:
+            print(f"  window {old_window_id}: {len(tabs)} tabs, {sum(map(len, tabs.values()))} panes")
+        return 0
+
+    for _old_window_id, tabs in plan:
+        new_window_id: int | None = None
+        active_tab: int | None = None
+        for old_tab_id in sorted(tabs):
+            tab_panes = sorted(tabs[old_tab_id], key=lambda pane: (int(pane.get("top_row", 0)), int(pane.get("left_col", 0)), -pane_area(pane)))
+            root = tab_panes[0]
+            command = ["spawn"]
+            if new_window_id is None:
+                command += ["--new-window", "--workspace", str(root.get("workspace") or "default")]
+            else:
+                command += ["--window-id", str(new_window_id)]
+            command += ["--cwd", pane_cwd(root), "--", "/bin/bash", "-l"]
+            root_id = run_wezterm(*command)
+            if new_window_id is None:
+                live = fetch_panes(no_auto_start=False)
+                matching = next((pane for pane in live if str(pane.get("pane_id")) == root_id), None)
+                if not matching:
+                    raise WezTermError("could not find the newly created WezTerm window")
+                new_window_id = int(matching["window_id"])
+            created: list[tuple[dict[str, Any], str]] = [(root, root_id)]
+            for pane in tab_panes[1:]:
+                parent = find_split_parent(pane, created)
+                if parent is None:
+                    # A malformed/old snapshot: preserve the pane as a tab rather
+                    # than losing it.  Valid WezTerm layouts normally never use this.
+                    pane_id = run_wezterm("spawn", "--window-id", str(new_window_id), "--cwd", pane_cwd(pane), "--", "/bin/bash", "-l")
+                else:
+                    direction, parent_id = parent
+                    parent_pane = next(old for old, live_id in created if int(live_id) == parent_id)
+                    pane_id = run_wezterm(
+                        "split-pane", "--pane-id", str(parent_id), f"--{direction}",
+                        "--percent", str(split_percent(pane, parent_pane, direction)),
+                        "--cwd", pane_cwd(pane), "--", "/bin/bash", "-l",
+                    )
+                created.append((pane, pane_id))
+            title = str(root.get("tab_title") or "")
+            if title:
+                run_wezterm("set-tab-title", "--pane-id", root_id, title)
+            if any(bool(pane.get("is_active")) for pane in tab_panes):
+                active_tab = int(root_id)
+        if active_tab is not None:
+            run_wezterm("activate-pane", "--pane-id", str(active_tab))
+    print(f"restored {len(windows)} windows / {len(panes)} panes from {snapshot}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backup-dir", type=Path, default=DEFAULT_BACKUP_DIR)
+    parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, help="snapshots to retain (default: 4)")
+    subcommands = parser.add_subparsers(dest="action", required=True)
+    subcommands.add_parser("backup", help="write a layout snapshot if WezTerm is running")
+    restore = subcommands.add_parser("restore", help="recreate a saved layout in the running mux")
+    restore.add_argument("snapshot", nargs="?", help="snapshot to restore (default: newest)")
+    restore.add_argument("--dry-run", action="store_true")
+    subcommands.add_parser("list", help="list saved snapshots")
+    args = parser.parse_args()
+    if args.keep < 1:
+        parser.error("--keep must be at least 1")
+    if args.action == "backup":
+        return create_backup(args.backup_dir, args.keep)
+    if args.action == "list":
+        for snapshot in sorted(args.backup_dir.glob("wezterm-session-*.json"), reverse=True):
+            print(snapshot)
+        return 0
+    try:
+        snapshot, panes = load_snapshot(args.snapshot, args.backup_dir)
+        return restore_snapshot(snapshot, panes, args.dry_run)
+    except (OSError, json.JSONDecodeError, WezTermError) as error:
+        print(f"wezterm-session: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
