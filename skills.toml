@@ -26,6 +26,10 @@ path = "skills/job-search"
 repo = "mvanhorn/last30days-skill"
 path = "skills/last30days"
 
+[skills.powershell-ssh-skill]
+repo = "https://github.com/Na2H2P2O7/powershell-ssh-skill"
+files = ["SKILL.md", "scripts/run-powershell.sh"]
+
 [skills.qmd]
 repo = "tobi/qmd"
 path = "skills/qmd"
