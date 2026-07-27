@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Wrapper around `bd` (beads) that forces `bd init --skip-agents`.
+#
+# Why: `bd init` scaffolds an AGENTS.md into the repo root by default. We keep
+# agent instructions in ~/toolbox/AGENTS.md and symlink them per-machine, so a
+# per-repo copy is always wrong here. In the chezmoi source directory it is
+# actively broken: chezmoi reads a bare AGENTS.md in the source root as a source
+# entry for ~/AGENTS.md, which collides with symlink_AGENTS.md.tmpl and makes
+# every chezmoi command fail with "AGENTS.md: inconsistent state".
+#
+# There is no env var or global config for this in bd 1.1.0 (--skip-agents is
+# flag-only), hence the wrapper. It lives in ~/toolbox/bin, which precedes
+# ~/.bun/bin on PATH, and PATH is set before .bashrc's interactive guard, so
+# non-interactive shells (agents, scripts) are covered too.
+#
+# Escape hatch: run the real binary directly, e.g. ~/.bun/bin/bd init.
+
+set -euo pipefail
+
+# Resolve the next `bd` on PATH that is not this wrapper.
+find_real_bd() {
+  local self candidate dir
+  self=$(readlink -f "${BASH_SOURCE[0]}")
+  IFS=: read -ra dirs <<<"$PATH"
+  for dir in "${dirs[@]}"; do
+    [ -n "$dir" ] || continue
+    candidate="$dir/bd"
+    [ -x "$candidate" ] && [ ! -d "$candidate" ] || continue
+    [ "$(readlink -f "$candidate")" = "$self" ] && continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+real_bd=$(find_real_bd) || {
+  echo "bd wrapper: could not find the real bd on PATH" >&2
+  exit 127
+}
+
+if [ "${1:-}" = "init" ]; then
+  # Only add the flag when it is not already there, so an explicit
+  # `bd init --skip-agents` stays a single flag.
+  already_skipping=0
+  for arg in "$@"; do
+    [ "$arg" = "--skip-agents" ] && already_skipping=1 && break
+  done
+  if [ "$already_skipping" -eq 0 ]; then
+    shift
+    set -- init --skip-agents "$@"
+  fi
+fi
+
+exec "$real_bd" "$@"
