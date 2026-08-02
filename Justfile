@@ -18,6 +18,9 @@ skills-test:
 summarize-test:
   python -B -m unittest discover -s bin/tests -p 'test_summarize.py' -v
 
+test-td-reschedule-overdue:
+  python -B -m unittest discover -s bin/tests -p 'test_td_reschedule_overdue.py' -v
+
 web-clip-test:
   python -B -m unittest discover -s tests -p 'test_web_clip.py' -v
 

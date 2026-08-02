@@ -1,0 +1,618 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Bring overdue recurring Todoist tasks to their current valid occurrence.
+
+Daily routines land on the current calendar day, even when today's clock time
+has already passed. Other recurrence rules advance to their next valid day, so
+an overdue "every Tuesday at 7:00pm" lands on the next Tuesday, not on whatever
+day this happens to run.
+
+How, and why not the obvious ways — all of these were measured against the API,
+and every failure mode below is silent (`td` still exits 0):
+
+  * `td task update --due "<bare date>"` destroys the recurrence rule outright:
+    isRecurring flips to false and due.string becomes the literal date.
+  * `td task reschedule <ref> YYYY-MM-DD` keeps the rule but strips the task's
+    time-of-day, AND deletes every relative reminder on the task.
+  * `td task reschedule <ref> YYYY-MM-DDTHH:MM:SS` is lossless, but it is a
+    one-off override: it pins the task to exactly the datetime you pass. An
+    overdue Tuesday task shoved to "today" then sits on a Monday until someone
+    completes it.
+
+  * `td task update --due "<the task's own due.string>"` advances recurrence
+    state; it does NOT idempotently re-evaluate the rule. Repeating it on a
+    current daily task advances one day each time. On an overdue daily task it
+    skips today's occurrence entirely, even when today's clock time is still
+    ahead. This was the bug in the original implementation.
+
+Daily rules therefore use a lossless full-datetime `reschedule` to today's
+date while preserving the task's existing clock time. Live verification showed
+that this also preserves relative reminders and that completing an already-
+passed occurrence today advances normally to tomorrow. All-day daily tasks use
+a date-only target because adding a synthetic midnight would change their
+meaning; all writes are still verified afterward.
+
+Non-daily unanchored rules use the occurrence-advance behavior intentionally.
+For example, advancing an overdue Saturday task on Sunday correctly lands on
+the next Saturday while keeping recurrence, time-of-day, and reminders.
+
+One non-daily rule shape breaks that: an anchored rule such as
+"every Monday at 5pm starting 2026-01-01". Re-applying it makes Todoist
+evaluate the series from its anchor, which can move a task BACKWARD. Those take
+the probe path — a throwaway task carrying the rule with the anchor clause
+stripped is created, the date Todoist computes for it is read off, the
+throwaway is deleted, and the real task is moved there with a lossless datetime
+`reschedule`. The real task's rule is never rewritten, and Todoist still does
+all the date maths. Daily anchored rules use the same direct-to-today path as
+other daily rules, so their anchor is never re-evaluated or rewritten.
+
+Unanchored non-daily rules that fail to move forward for any other reason fall
+back to the same probe path, so no task is left sitting in the past.
+
+After every write the task and its reminders are re-read to prove the rule, the
+recurrence flag, and the reminder set all survived.
+
+Usage:
+    td-reschedule-overdue                          # Routines, for real
+    td-reschedule-overdue --dry-run                # show what would change
+    td-reschedule-overdue --project Day --project Routines
+    td-reschedule-overdue --log ~/logs/rs.log      # append a timestamped run
+
+Exit codes: 0 = clean, 1 = at least one task failed or lost data, 2 = setup error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from pathlib import Path
+
+TD_TIMEOUT_SECONDS = 30
+
+# Todoist accepts "every day", "everyday", and "daily" for the same rule.
+DAILY_RULE_PATTERN = re.compile(r"\b(every\s*day|daily)\b", re.IGNORECASE)
+
+# A due.string that is just a date/datetime means the recurrence was already
+# destroyed by an earlier bare-date update; we cannot recover the rule.
+LITERAL_DATE_RULE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2})?")
+
+# A "starting <date>" / "from <date>" clause anchors the series at that date.
+# Re-applying such a rule makes Todoist re-evaluate from the anchor, which for a
+# past anchor moves the task BACKWARD (measured: "every day at 5pm starting
+# 2026-01-01" sitting on Jul 10 re-applied to Jan 1). Those rules take the probe
+# path below instead. "until"/"ending" clauses only bound the end of the series
+# and re-apply correctly, so they are left alone.
+ANCHOR_CLAUSE_PATTERN = re.compile(
+    r"\s+(?:starting|from)\s+.*?(?=\s+(?:until|ending|ends?)\b|$)", re.IGNORECASE
+)
+
+# Probe tasks are transient. The name makes a leaked one obvious and greppable.
+PROBE_TASK_NAME = "td-reschedule-overdue probe (safe to delete)"
+
+
+class TdError(RuntimeError):
+    """A td invocation failed or hung."""
+
+
+@dataclass
+class TaskOutcome:
+    content: str
+    rule: str
+    was_due: str
+    now_due: str = ""
+    status: str = "pending"  # advanced | would-advance | failed | damaged
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def is_failure(self) -> bool:
+        return self.status in {"failed", "damaged"}
+
+
+# --------------------------------------------------------------------------
+# td plumbing
+# --------------------------------------------------------------------------
+
+
+def run_td(*args: str) -> str:
+    """Run td and return stdout. Raises TdError on failure or hang."""
+    try:
+        result = subprocess.run(
+            ["td", "--no-spinner", *args],
+            capture_output=True,
+            text=True,
+            timeout=TD_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError as exc:
+        raise TdError("`td` is not on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TdError(
+            f"`td {' '.join(args)}` hung for {TD_TIMEOUT_SECONDS}s.\n"
+            "  Most likely the OS keyring is locked — td blocks forever on the\n"
+            "  unlock prompt. Fix: export TODOIST_API_TOKEN=$(op read "
+            "op://clankers/todoist/password)\n"
+            "  or unlock the login keyring. See "
+            "allplace/wiki/engineering/cli-hangs-on-locked-os-keyring.md"
+        ) from exc
+
+    if result.returncode != 0:
+        raise TdError(
+            f"`td {' '.join(args)}` exited {result.returncode}: "
+            f"{(result.stderr or result.stdout).strip()[:400]}"
+        )
+    return result.stdout
+
+
+def fetch_tasks(project: str) -> list[dict]:
+    payload = json.loads(run_td("task", "list", "--project", project, "--json"))
+    return payload.get("results", [])
+
+
+def fetch_task(task_id: str) -> dict:
+    return json.loads(run_td("task", "view", f"id:{task_id}", "--json"))
+
+
+def reminder_fingerprint(task_id: str) -> tuple | None:
+    """Stable identity of a task's reminders, or None if it cannot be read.
+
+    Deliberately ignores each reminder's own due date, which legitimately moves
+    with the task. What must NOT change is which reminders exist.
+    """
+    try:
+        payload = json.loads(run_td("reminder", "list", "--task", f"id:{task_id}", "--json"))
+    except (TdError, json.JSONDecodeError):
+        return None
+    reminders = payload.get("results", [])
+    return tuple(sorted((r.get("type", "?"), r.get("minuteOffset")) for r in reminders))
+
+
+# --------------------------------------------------------------------------
+# Date handling
+# --------------------------------------------------------------------------
+
+
+def parse_day(raw: str) -> date | None:
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw.split("T")[0])
+    except ValueError:
+        return None
+
+
+def time_of_day(raw: str) -> str | None:
+    """The 'HH:MM:SS' part of a due date, or None for an all-day task."""
+    return raw.split("T", 1)[1] if raw and "T" in raw else None
+
+
+def occurrence_on_day(raw_due: str, target_day: date) -> str:
+    """Move a due value to a calendar day without changing its clock time."""
+    clock = time_of_day(raw_due)
+    return f"{target_day.isoformat()}T{clock}" if clock else target_day.isoformat()
+
+
+def strip_anchor_clause(rule: str) -> str:
+    """The rule with any 'starting <date>' / 'from <date>' clause removed."""
+    return ANCHOR_CLAUSE_PATTERN.sub("", rule).strip()
+
+
+def has_anchor_clause(rule: str) -> bool:
+    return strip_anchor_clause(rule) != rule.strip()
+
+
+def probe_next_occurrence(project: str, rule: str) -> str | None:
+    """Ask Todoist when this rule next fires, without touching the real task.
+
+    Creates a throwaway task carrying the rule (anchor clause stripped so the
+    series is evaluated from now), reads the due date Todoist computed for it,
+    and deletes it. Returns None if the probe could not be run.
+
+    This is how anchored rules get a correct date without us reimplementing
+    Todoist's recurrence parser, and without rewriting the user's rule.
+    """
+    base_rule = strip_anchor_clause(rule)
+    if not base_rule:
+        return None
+
+    probe_id: str | None = None
+    try:
+        created = json.loads(
+            run_td(
+                "task", "add", PROBE_TASK_NAME,
+                "--project", project, "--due", base_rule, "--json",
+            )
+        )
+        probe_id = created["id"]
+        return (created.get("due") or {}).get("date") or None
+    except (TdError, json.JSONDecodeError, KeyError):
+        return None
+    finally:
+        if probe_id:
+            try:
+                run_td("task", "delete", f"id:{probe_id}", "--yes")
+            except TdError:
+                pass  # surfaced by the stray-probe sweep on the next run
+
+
+def format_day(raw: str) -> str:
+    parsed = parse_day(raw)
+    if parsed is None:
+        return raw or "—"
+    clock = time_of_day(raw)
+    stamp = parsed.strftime("%a %b %d")
+    return f"{stamp} {clock[:5]}" if clock else stamp
+
+
+# --------------------------------------------------------------------------
+# Core
+# --------------------------------------------------------------------------
+
+
+def needs_advance(due_day: date, rule: str, today: date) -> bool:
+    """Overdue, or a daily task that has drifted into the future."""
+    if due_day < today:
+        return True
+    # "every day" tasks should never sit beyond today.
+    return bool(DAILY_RULE_PATTERN.search(rule)) and due_day > today
+
+
+def landed_on_or_after(task_id: str, minimum_day: date) -> bool:
+    """Whether the task's due day is at least the requested calendar day."""
+    try:
+        due = fetch_task(task_id).get("due") or {}
+    except TdError:
+        return False
+    due_day = parse_day(due.get("date", ""))
+    return due_day is not None and due_day >= minimum_day
+
+
+def advance_daily_to_calendar_day(
+    task_id: str,
+    raw_due: str,
+    target_day: date,
+    outcome: TaskOutcome,
+) -> bool:
+    """Place a daily routine on the target calendar day, even after its time.
+
+    A full datetime is lossless for timed tasks. An all-day task must keep a
+    date-only value or it would gain an artificial midnight due time.
+    """
+    target = occurrence_on_day(raw_due, target_day)
+    try:
+        run_td("task", "reschedule", f"id:{task_id}", target)
+    except TdError as exc:
+        outcome.notes.append(f"same-day reschedule failed: {str(exc).splitlines()[0]}")
+        return False
+    return landed_on_or_after(task_id, target_day)
+
+
+def advance_via_reapply(
+    task_id: str,
+    rule: str,
+    minimum_day: date,
+    outcome: TaskOutcome,
+) -> bool:
+    """Advance a non-daily task through Todoist's recurrence engine.
+
+    Re-sending due.string advances recurrence state. This is appropriate for
+    non-daily overdue rules, where the desired destination is the next valid
+    occurrence after the current day.
+    """
+    try:
+        run_td("task", "update", f"id:{task_id}", "--due", rule)
+    except TdError as exc:
+        outcome.notes.append(f"re-apply failed: {str(exc).splitlines()[0]}")
+        return False
+    return landed_on_or_after(task_id, minimum_day)
+
+
+def advance_via_probe(
+    task_id: str,
+    project: str,
+    rule: str,
+    minimum_day: date,
+    outcome: TaskOutcome,
+) -> bool:
+    """Compute the next occurrence with a throwaway task, then reschedule to it.
+
+    `reschedule` with a full datetime is lossless, so the task keeps its
+    original rule verbatim — including the anchor clause we stripped for the
+    probe.
+    """
+    target = probe_next_occurrence(project, rule)
+    if not target:
+        outcome.notes.append("probe could not determine the next occurrence")
+        return False
+
+    target_day = parse_day(target)
+    if target_day is None or target_day < minimum_day:
+        outcome.notes.append(f"probe returned a past date ({target})")
+        return False
+
+    try:
+        run_td("task", "reschedule", f"id:{task_id}", target)
+    except TdError as exc:
+        outcome.notes.append(f"reschedule failed: {str(exc).splitlines()[0]}")
+        return False
+    return landed_on_or_after(task_id, minimum_day)
+
+
+def advance_one(
+    task: dict,
+    project: str,
+    dry_run: bool,
+    reference_day: date | None = None,
+) -> TaskOutcome:
+    """Advance one task according to daily catch-up or non-daily recurrence."""
+    task_id = task["id"]
+    due = task.get("due") or {}
+    raw_due = due.get("date", "")
+    rule = due.get("string", "")
+
+    outcome = TaskOutcome(content=task["content"], rule=rule, was_due=raw_due)
+    run_day = reference_day or date.today()
+
+    if not rule:
+        outcome.status = "failed"
+        outcome.notes.append("recurring task has an empty rule")
+        return outcome
+
+    if dry_run:
+        outcome.status = "would-advance"
+        # Daily targets are deterministic. Todoist computes non-daily dates
+        # server-side, which cannot be previewed without a mutation.
+        outcome.now_due = (
+            occurrence_on_day(raw_due, run_day)
+            if DAILY_RULE_PATTERN.search(rule)
+            else ""
+        )
+        return outcome
+
+    reminders_before = reminder_fingerprint(task_id)
+
+    # Daily catch-up is calendar-based: today remains the current occurrence
+    # even after its time has passed. This also bypasses anchor re-evaluation.
+    if DAILY_RULE_PATTERN.search(rule):
+        moved = advance_daily_to_calendar_day(
+            task_id, raw_due, run_day, outcome,
+        )
+    # An anchored non-daily rule would re-evaluate from its anchor and can move
+    # backward, so it goes straight to the probe path.
+    elif has_anchor_clause(rule):
+        outcome.notes.append(f"anchored rule; next date computed via probe on "
+                             f"{strip_anchor_clause(rule)!r}")
+        moved = advance_via_probe(task_id, project, rule, run_day, outcome)
+    else:
+        moved = advance_via_reapply(task_id, rule, run_day, outcome)
+        # Self-heal: if re-apply did not land in the future for any reason,
+        # fall back to the probe path rather than leaving the task wrong.
+        if not moved:
+            outcome.notes.append("re-apply did not move it forward; retrying via probe")
+            moved = advance_via_probe(task_id, project, rule, run_day, outcome)
+
+    if not moved:
+        outcome.status = "failed"
+        return outcome
+
+    # Verify against the server rather than trusting the exit code.
+    try:
+        after = fetch_task(task_id)
+    except TdError as exc:
+        outcome.status = "failed"
+        outcome.notes.append(f"advanced but could not verify: {exc}")
+        return outcome
+
+    after_due = after.get("due") or {}
+    outcome.now_due = after_due.get("date", "")
+    outcome.status = "advanced"
+
+    if not after_due.get("isRecurring", False):
+        outcome.status = "damaged"
+        outcome.notes.append(
+            f"RECURRENCE DESTROYED — rule is now {after_due.get('string', '?')!r}"
+        )
+    elif after_due.get("string", "") != rule:
+        outcome.status = "damaged"
+        outcome.notes.append(
+            f"rule changed: {rule!r} -> {after_due.get('string', '')!r}"
+        )
+
+    if time_of_day(raw_due) != time_of_day(outcome.now_due):
+        outcome.status = "damaged"
+        outcome.notes.append(
+            f"time-of-day changed: {time_of_day(raw_due)!r} -> "
+            f"{time_of_day(outcome.now_due)!r}"
+        )
+
+    expected_daily_due = occurrence_on_day(raw_due, run_day)
+    if DAILY_RULE_PATTERN.search(rule) and outcome.now_due != expected_daily_due:
+        outcome.status = "damaged"
+        outcome.notes.append(
+            f"daily task missed today's occurrence: expected "
+            f"{expected_daily_due}, got {outcome.now_due or 'no due date'}"
+        )
+
+    # The destination must be today or later. A timed daily occurrence earlier
+    # today is intentionally current rather than damaged.
+    new_day = parse_day(outcome.now_due)
+    if new_day is None:
+        outcome.status = "damaged"
+        outcome.notes.append(f"missing or unparseable due date ({outcome.now_due!r})")
+    elif new_day < run_day:
+        outcome.status = "damaged"
+        outcome.notes.append(f"still in the past ({outcome.now_due}) — rule did not advance")
+
+    reminders_after = reminder_fingerprint(task_id)
+    if reminders_before is None or reminders_after is None:
+        outcome.notes.append("reminders could not be verified")
+    elif reminders_after != reminders_before:
+        outcome.status = "damaged"
+        outcome.notes.append(
+            f"REMINDERS CHANGED: {len(reminders_before)} -> {len(reminders_after)}"
+        )
+
+    return outcome
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+
+class Reporter:
+    def __init__(self, log_path: Path | None) -> None:
+        self.log_path = log_path
+        if log_path:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def __call__(self, message: str = "") -> None:
+        print(message)
+        if self.log_path:
+            with open(self.log_path, "a") as handle:
+                handle.write(message + "\n")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Advance overdue recurring Todoist tasks, preserving "
+        "recurrence rules, time-of-day, and reminders.",
+    )
+    parser.add_argument(
+        "--project", action="append", metavar="NAME",
+        help="Project to scan; repeatable. Default: Routines",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Show changes, make none")
+    parser.add_argument("--log", metavar="PATH", help="Append output to this file")
+    args = parser.parse_args()
+
+    projects = args.project or ["Routines"]
+    today = date.today()
+
+    say = Reporter(Path(args.log).expanduser() if args.log else None)
+
+    mode = "DRY RUN — no changes will be made" if args.dry_run else "live"
+    say("")
+    say("=" * 68)
+    say(f"td-reschedule-overdue — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ({mode})")
+    say(f"projects: {', '.join(projects)}   today: {today}")
+    say("Daily tasks move to today; other tasks advance by their recurrence rule.")
+    say("=" * 68)
+
+    # (task, project) — the project is needed to create probe tasks alongside.
+    to_fix: list[tuple[dict, str]] = []
+    current: list[dict] = []
+    skipped: list[tuple[str, str]] = []
+    stray_probes: list[tuple[str, str]] = []
+
+    for project in projects:
+        try:
+            tasks = fetch_tasks(project)
+        except TdError as exc:
+            say(f"\nERROR reading project {project!r}:\n  {exc}")
+            return 2
+
+        for task in tasks:
+            content = task["content"][:60]
+
+            # A probe left behind by a run that died mid-flight.
+            if task["content"] == PROBE_TASK_NAME:
+                stray_probes.append((task["id"], project))
+                continue
+
+            due = task.get("due")
+            if not due:
+                skipped.append((content, "no due date"))
+                continue
+            rule = due.get("string", "")
+            if not due.get("isRecurring", False):
+                reason = "non-recurring"
+                if LITERAL_DATE_RULE_PATTERN.match(rule):
+                    reason = f"non-recurring — rule is a literal date ({rule!r}); " \
+                             "recurrence was likely destroyed earlier"
+                skipped.append((content, reason))
+                continue
+            due_day = parse_day(due.get("date", ""))
+            if due_day is None:
+                skipped.append((content, f"unparseable due date {due.get('date')!r}"))
+                continue
+            if needs_advance(due_day, rule, today):
+                to_fix.append((task, project))
+            else:
+                current.append(task)
+
+    if stray_probes and not args.dry_run:
+        say(f"\nCleaning up {len(stray_probes)} stray probe task(s) from an earlier run.")
+        for probe_id, _ in stray_probes:
+            try:
+                run_td("task", "delete", f"id:{probe_id}", "--yes")
+            except TdError as exc:
+                say(f"  could not delete probe id:{probe_id}: {exc}")
+
+    if skipped:
+        say(f"\nSkipped ({len(skipped)}):")
+        for content, reason in skipped:
+            say(f"  - {content}  [{reason}]")
+
+    if current:
+        say(f"\nAlready current ({len(current)}):")
+        for task in current:
+            due = task["due"]
+            say(f"  - {task['content'][:55]:<55} {format_day(due['date'])}  ({due['string']})")
+
+    if not to_fix:
+        say("\nNothing to advance. Done.")
+        return 0
+
+    say(f"\nNeeds advancing ({len(to_fix)}):")
+    for task, _ in to_fix:
+        due = task["due"]
+        say(f"  - {task['content'][:55]:<55} {format_day(due['date'])}  ({due['string']})")
+
+    say("\n" + "-" * 68)
+    outcomes = [
+        advance_one(task, project, args.dry_run, today)
+        for task, project in to_fix
+    ]
+
+    say("Results")
+    say("-" * 68)
+    marks = {
+        "advanced": "OK  ",
+        "would-advance": "DRY ",
+        "failed": "FAIL",
+        "damaged": "DMG ",
+    }
+    for outcome in outcomes:
+        say(f"{marks.get(outcome.status, '?   ')} {outcome.content[:58]}")
+        # Todoist computes non-daily occurrences server-side. Daily dry runs
+        # can show their deterministic same-day target.
+        destination = format_day(outcome.now_due) if outcome.now_due else "next occurrence"
+        say(f"       {format_day(outcome.was_due)} -> {destination}   ({outcome.rule})")
+        for note in outcome.notes:
+            say(f"       ! {note}")
+
+    failures = [o for o in outcomes if o.is_failure]
+    say("")
+    if args.dry_run:
+        say(f"Dry run: {len(outcomes)} task(s) would move to a valid occurrence.")
+        if any(not outcome.now_due for outcome in outcomes):
+            say("(non-daily dates are computed by Todoist, so they are not shown here)")
+        return 0
+    if failures:
+        say(f"{len(outcomes) - len(failures)} advanced, {len(failures)} PROBLEM(S) — see above.")
+        return 1
+    say(f"{len(outcomes)} advanced. Recurrence, time-of-day, and reminders all verified intact.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
