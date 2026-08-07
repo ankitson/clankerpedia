@@ -1,0 +1,81 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["jinja2"]
+# ///
+"""frag — compose a text file from fragments via Jinja includes.
+
+Render a Jinja template to stdout (or a file with -o), resolving each
+`{% include %}` against one or more search directories. The template's own
+directory is always searched first, then any -I dirs in the order given.
+
+Included files are themselves rendered as Jinja, so a fragment can use
+`{% include %}` too; escape literal `{{`/`{%` in content if you don't want it
+interpreted. Use `{% include "x" ignore missing %}` for optional fragments.
+
+Examples:
+  frag AGENTS.md.j2                        # -> stdout
+  frag AGENTS.md.j2 -o AGENTS.md           # -> file (atomic write)
+  frag t.j2 -I fragments -I ~/notes        # extra include search dirs
+  cat t.j2 | frag - -I fragments           # template from stdin
+"""
+import argparse
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+from jinja2 import Environment, FileSystemLoader
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="frag", description="Compose text from fragments via Jinja includes."
+    )
+    ap.add_argument("template", help="template file, or '-' for stdin")
+    ap.add_argument(
+        "-I", "--include", action="append", default=[], metavar="DIR",
+        help="add a directory to the include search path (repeatable)",
+    )
+    ap.add_argument(
+        "-o", "--output", metavar="FILE",
+        help="write to FILE atomically instead of stdout",
+    )
+    args = ap.parse_args()
+
+    search: list[str] = []
+    source: str | None = None
+    template_name: str | None = None
+    if args.template == "-":
+        source = sys.stdin.read()
+    else:
+        tpath = Path(args.template).expanduser().resolve()
+        template_name = tpath.name
+        search.append(str(tpath.parent))
+    search += [str(Path(d).expanduser()) for d in args.include]
+
+    env = Environment(
+        loader=FileSystemLoader(search),
+        keep_trailing_newline=True,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    tmpl = env.from_string(source) if source is not None else env.get_template(template_name)
+    text = tmpl.render()
+
+    if args.output:
+        out = Path(args.output).expanduser().resolve()
+        fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=".frag-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            os.replace(tmp, out)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    else:
+        sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()

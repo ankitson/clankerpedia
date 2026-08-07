@@ -1,6 +1,11 @@
 # Toolbox helpers. Skill distribution is owned by the devdocker/dotfiles chezmoi
 # wiring. These commands only refresh external snapshots in the canonical tree.
 
+# Compose AGENTS.md from context/fragments via bin/frag. Run after editing a
+# fragment, ~/AGENTS.env.md, or the wiki INDEX.md.
+agents:
+  @bin/frag context/templates/AGENTS.md.j2 -I context/fragments -I ~ -I ~/hroot/allplace/wiki -o AGENTS.md
+
 skills-list:
   @bin/skillctl list
 
