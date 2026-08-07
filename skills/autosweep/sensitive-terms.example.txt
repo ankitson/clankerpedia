@@ -1,0 +1,8 @@
+# Copy this to sensitive-terms.txt (gitignored) and add your own terms — one per line.
+# Any line in a pending change matching one of these is flagged "sensitive" by
+# privacy-scan.py, so it can be remediated before the sweep commits/publishes it.
+# Lines starting with # are ignored. Matching is case-insensitive substring.
+#
+# Examples (replace with your real terms):
+# some-private-model-name
+# internal-project-codename
