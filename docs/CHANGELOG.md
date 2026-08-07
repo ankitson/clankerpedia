@@ -1,6 +1,73 @@
 # Toolbox Changelog
 
+## 2026-08-02
+
+### td-reschedule-overdue: keep daily catch-up on today
+
+- Changed overdue daily tasks to use a recurrence-safe full-datetime
+  reschedule to today's calendar occurrence instead of re-sending the rule,
+  which silently skipped today.
+- Kept non-daily occurrence advancement intact and strengthened post-write
+  verification to require the exact daily destination and time-of-day.
+- Added focused regression coverage, a Justfile test command, corrected the
+  Todoist CLI skill, and documented the live API behavior and incident.
+
+## 2026-07-26
+
+### wezterm-session: retained layout backup and restore
+
+- Added `bin/wezterm-session`, which saves the live WezTerm window/tab/split
+  layout, directories, workspaces, and tab titles; it retains four snapshots
+  by default and restores fresh login shells into the saved layout.
+- Added a user-level systemd timer that invokes the backup every 15 minutes.
+  It safely skips an interval when no WezTerm mux is available.
+
+## 2026-07-24
+
+### todoist-cli: verified recurrence-preserving reschedule
+
+- Replaced the stale warning that egress policy blocks every reschedule with
+  verified guidance to use `td task reschedule` for recurring tasks.
+
+## 2026-07-17
+
+### x-research: Bird CLI route
+
+- Added the external `bird` skill from `windhood-jza/openclaw-bird-skill`.
+- Switched `x-research` to Bird while retaining its research workflow for
+  query decomposition, thread follow-up, source verification, and synthesis.
+
+### web-search: routing layer and browser fallback
+
+- Added the custom `web-search` skill as the canonical routing policy for web
+  research, with SearXNG as the default discovery backend.
+- Renamed the imported browser-driven search skill to `browser-web-search`,
+  made it an explicit Google/DDG fallback, and retained its upstream registry
+  record as a local fork so future syncs preserve the routing-specific edits.
+- Disabled automatic invocation for `searxng` and `browser-web-search`; the
+  `web-search` router explicitly selects them when warranted.
+- Made every Toolbox route a relative sibling-skill pointer rather than an MCP
+  reference or a hardcoded implementation command.
+
 ## 2026-07-14
+
+### chatterbox-tts: local text-to-speech skill
+
+- Added `skills/chatterbox-tts`, which produces local audio files through the
+  OpenAI-compatible Chatterbox `/v1/audio/speech` endpoint.
+- Defaults to model `chatterbox` and voice `Alice`, with per-request and
+  environment-based endpoint, model, and voice overrides.
+- Added an atomic, standard-library Python client with text-file input, output
+  format, and speech-speed options.
+
+### disk-space-audit: host-aware disk and model cleanup
+
+- Expanded `skills/disk-space-audit/SKILL.md` with the homeserver filesystem
+  map, Compose sources, Docker orphan/shared-layer classification, and explicit
+  locations to inspect for logs, databases, caches, and model weights.
+- Added a verified cross-filesystem model-move workflow and the convention that
+  container model storage belongs under `/mnt/store-ext4/models`.
+- Kept `disable-model-invocation: true`; the skill must be invoked explicitly.
 
 ### parakeet-asr: reusable OpenAI-compatible transcription skill
 
@@ -11,6 +78,85 @@
 - Made writes atomic and normalized compatible API responses that return a JSON
   `text` field despite requesting plain text, preventing API failures or JSON
   wrappers from becoming bogus `.txt` transcripts.
+
+## 2026-07-11
+
+### frag: standalone fragment-composition utility + AGENTS.md compose
+- Added `bin/frag` (uv + PEP 723; jinja2): a generic tool that renders a Jinja
+  template to stdout (or `-o FILE`, atomic), resolving `{% include %}` against
+  `-I` search dirs. Knows nothing about toolbox/profiles — reusable for any
+  fragment-assembly job. Supports `-` (stdin template) and
+  `{% include "x" ignore missing %}`.
+- Added `context/fragments/{security,core,routing}.md` and
+  `context/templates/AGENTS.md.j2`. The template inlines the per-host
+  `~/AGENTS.env.md` (chezmoi output) and the machine index
+  `~/hroot/allplace/wiki/INDEX.md` between `<!-- BEGIN/END generated -->`
+  markers. `security.md` rescues the secrets-redaction rules that previously
+  existed only in a drifted `/home/ankit/AGENTS.md` hand-copy.
+- `AGENTS.md` is now a composed artifact (header comment says so); the
+  Claude-only `@~/AGENTS.env.md` import is gone — env + machine index are
+  inlined for every harness. `just agents` runs the compose (`bin/frag
+  context/templates/AGENTS.md.j2 -I context/fragments -I ~ -I
+  ~/hroot/allplace/wiki -o AGENTS.md`); toolbox-specific wiring lives in the
+  recipe, not the tool.
+
+## 2026-07-01
+
+### untangle: new skill for extracting publishable repos from personal tangle
+- Added `skills/untangle/SKILL.md`: a process skill for turning code tangled in
+  personal infrastructure into a stranger-runnable module, repo, package, or
+  product. Phases: qualify demand → find the seam (second-user test,
+  parameterize/adapt/cut lists) → stranger-README first → extract with cold
+  tests and fresh git history → privacy scrub → cold-clone verification →
+  report with the remaining productization rungs.
+- Names the four recurring personal adapters (devbox exec, Bifrost, OpenClaw,
+  AgentsView) so extractions treat them as interfaces with the personal setup
+  as the reference implementation.
+- Ends with a `# human version (agents skip this)` section — a brief
+  Ankit-tailored summary; agents consuming the skill should skip it.
+
+## 2026-06-30
+
+### wezterm-sync: one-ref build + deploy across all hosts
+- Added `bin/wezterm-sync`, a Python orchestrator that builds a custom wezterm
+  from one canonical git ref and deploys it natively to every host that talks to
+  the mux (server = Linux, `m2book` = macOS, `desktop-win` = Windows).
+- Binaries are not portable across os/arch, so each host fetches the exact commit
+  from `origin` and builds it *over ssh*; we install into each platform's wezterm
+  path with a timestamped backup and verify the resulting `--version`.
+- Server builds in an isolated `git worktree` (shared `CARGO_TARGET_DIR`) so the
+  working branch is never disturbed; macOS re-signs the bundle ad-hoc.
+- Windows uses a `.tag`-seeded source tarball (no git clone) built on the server
+  and a shipped `bin/wezterm-build-windows.cmd` that encodes the toolchain recipe
+  (VsDevCmd, Strawberry Perl, rustup-shim bypass) and assembles the portable
+  `WezTerm-windows-<tag>\` bundle (exes + ANGLE/mesa DLLs) under `wezterm-builds`.
+- **First real run (2026-06-30):** deployed the blessed custom build
+  (`fix/panefocused-client-focus-metadata` @ `06c71b67`, 5 PaneFocused
+  focus-metadata commits on top of upstream) to server, `m2book`, and
+  `desktop-win`. All three now report `wezterm 20260625-133254-06c71b67`. Fixed
+  three bugs the run surfaced: an scp destination wrapped in literal quotes
+  (broken with no intervening shell), `bash -lc` ssh wrapping that split `&&`
+  chains apart, and git-mode hosts not seeding `.tag` (stale embedded version on
+  incremental builds — `wezterm-version/build.rs` only re-reads `.tag` when
+  `build.rs` itself is touched, since its `rerun-if-changed` is keyed to the HEAD
+  ref file, which a detached checkout doesn't change). Also fixed the Windows
+  batch: the `cmd /c ""..."" ` wrapper corrupted `%SRC%`'s quoting and silently
+  packaged an empty bundle while still exiting 0; added a post-package
+  existence check so that fails loudly, and moved `CARGO_TARGET_DIR` outside the
+  re-extracted source tree so reruns build incrementally.
+- Safe by default: dry-run unless `--apply`; never restarts the live mux unless
+  `--restart-mux`; unreachable hosts are skipped, not fatal.
+- Justfile: `just wezterm-sync` (plan) and `just wezterm-sync-apply [ref]` (deploy).
+
+## 2026-06-27
+
+### AgentsView search API documentation
+- Updated `skills/agentsview-api/SKILL.md` to use the dedicated
+  `/api/v1/search` endpoint for transcript content search.
+- Documented the search response shape, including `results[].session_id`,
+  snippet fields, `count`, and `next`.
+- Fixed the transcript formatting example to read from `.messages[]` and pass a
+  larger message `limit` for long sessions.
 
 ## 2026-06-24
 
