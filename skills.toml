@@ -25,6 +25,7 @@ ref = "master"
 [skills.browser-web-search]
 repo = "ogulcancelik/agent-skills"
 path = "skills/web-search"
+fork = true
 
 [skills.job-search]
 repo = "ssh://git@git.home.ankitson.com:1024/ankitson/job-search.git"
