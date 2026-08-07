@@ -7,3 +7,6 @@ agent-scripts/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Personal ADHD coaching profile — never publish
+skills/adhd/references/profile.md
