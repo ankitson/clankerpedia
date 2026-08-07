@@ -1,0 +1,21 @@
+#!/bin/bash
+# Wrapper around xdg-open that routes pi-web-access curator URLs to
+# open-m2book-chrome (opens them in a CDP-controlled Chrome on m2book)
+# instead of trying to open a browser on this headless server.
+#
+# Install: place earlier in PATH than /usr/bin/xdg-open, e.g.:
+#   ln -sf ~/hroot/projects/toolbox/bin/xdg-open ~/.local/bin/xdg-open
+
+URL="${1:-}"
+
+# Resolve symlink to find sibling scripts
+DIR="$(dirname "$(readlink -f "$0")")"
+
+# Detect pi-web-access curator URL: localhost with session param
+# Use grep -E so ? is a quantifier, not literal
+if echo "$URL" | grep -qE '^http://localhost:[0-9]+/.*session='; then
+    exec "$DIR/open-m2book-chrome.mjs" "$URL"
+fi
+
+# Everything else → real xdg-open
+exec /usr/bin/xdg-open "$URL"
