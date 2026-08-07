@@ -20,7 +20,7 @@ from urllib.parse import urlencode
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 console = Console()
-SEARXNG_URL = os.getenv("SEARXNG_URL", "https://search.home.ankitson.com")
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")
 
 def search_searxng(
     query: str,

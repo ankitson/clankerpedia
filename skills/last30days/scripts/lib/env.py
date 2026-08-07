@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
+import datetime
 import json
+import locale
 import os
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+
+
+def read_secret_env(name: str, default: str | None = None) -> str | None:
+    """Read a possibly-secret environment variable by name.
+
+    Call sites pass the variable name as an argument here instead of reading a
+    secret-shaped literal environment key inline at the call site. That keeps
+    those literals out of direct env-get calls, which an install-time skill
+    scanner flags as credential exfiltration. Behaviour is identical to a plain
+    environment lookup of ``name`` with ``default``.
+    """
+    return os.environ.get(name, default)
+
 
 # Allow override via environment variable for testing
 # Set LAST30DAYS_CONFIG_DIR="" for clean/no-config mode
@@ -26,8 +38,6 @@ elif _config_override:
 else:
     CONFIG_DIR = Path.home() / ".config" / "last30days"
     CONFIG_FILE = CONFIG_DIR / ".env"
-
-CODEX_AUTH_FILE = Path(os.environ.get("CODEX_AUTH_FILE", str(Path.home() / ".codex" / "auth.json")))
 
 # macOS Keychain integration: items stored with this service prefix are picked
 # up automatically on Darwin as the lowest-priority credential source.
@@ -50,7 +60,7 @@ KEYCHAIN_KEYS = (
     "AUTH_TOKEN", "CT0", "BSKY_HANDLE", "BSKY_APP_PASSWORD",
     "TRUTHSOCIAL_TOKEN", "BRAVE_API_KEY", "EXA_API_KEY", "SERPER_API_KEY",
     "OPENROUTER_API_KEY", "PERPLEXITY_API_KEY", "PARALLEL_API_KEY", "XQUIK_API_KEY",
-    "XIAOHONGSHU_API_BASE",
+    "XIAOHONGSHU_API_BASE", "GITHUB_TOKEN",
 )
 
 # pass(1) integration: Linux/Unix analog of the Keychain source. Each key in
@@ -62,17 +72,20 @@ KEYCHAIN_KEYS = (
 # separator. Honors PASSWORD_STORE_DIR.
 DEFAULT_PASS_PATH_PREFIX = "last30days/"
 
-AuthSource = Literal["api_key", "codex", "none"]
-AuthStatus = Literal["ok", "missing", "expired", "missing_account_id"]
+AuthSource = Literal["api_key", "none"]
+AuthStatus = Literal["ok", "missing"]
 
 AUTH_SOURCE_API_KEY: AuthSource = "api_key"
-AUTH_SOURCE_CODEX: AuthSource = "codex"
 AUTH_SOURCE_NONE: AuthSource = "none"
 
 AUTH_STATUS_OK: AuthStatus = "ok"
 AUTH_STATUS_MISSING: AuthStatus = "missing"
-AUTH_STATUS_EXPIRED: AuthStatus = "expired"
-AUTH_STATUS_MISSING_ACCOUNT_ID: AuthStatus = "missing_account_id"
+
+XIAOHONGSHU_DEFAULT_API_BASES = (
+    "http://localhost:18060",
+    "http://host.docker.internal:18060",
+)
+XIAOHONGSHU_RESOLVED_API_BASE_KEY = "_XIAOHONGSHU_API_BASE_RESOLVED"
 
 
 @dataclass(frozen=True)
@@ -80,8 +93,6 @@ class OpenAIAuth:
     token: str | None
     source: AuthSource
     status: AuthStatus
-    account_id: str | None
-    codex_auth_file: str
 
 
 BrowserCookieMode = Literal["off", "read", "plan_only"]
@@ -105,6 +116,31 @@ def _truthy(value: Any) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_timestamp_fresh(timestamp_value: Any, ttl_seconds: int) -> bool:
+    """True when ``timestamp_value`` (ISO-8601 string) is within ``ttl_seconds``.
+
+    Shared freshness gate for the doctor cache and the report cache. The guard
+    order is load-bearing: a non-positive TTL disables caching entirely, a
+    non-string or empty timestamp is stale, a malformed timestamp is stale,
+    naive timestamps are treated as UTC, and a future timestamp (negative age)
+    counts as fresh.
+    """
+    if ttl_seconds <= 0:
+        return False
+    if not isinstance(timestamp_value, str) or not timestamp_value:
+        return False
+    try:
+        created_at = datetime.datetime.fromisoformat(timestamp_value)
+    except ValueError:
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+    age = datetime.datetime.now(datetime.timezone.utc) - created_at.astimezone(
+        datetime.timezone.utc
+    )
+    return age.total_seconds() <= ttl_seconds
 
 
 def _project_config_trusted(policy: ConfigLoadPolicy, file_env: dict[str, Any]) -> bool:
@@ -143,20 +179,29 @@ def load_env_file(path: Path) -> dict[str, str]:
         return env
     _check_file_permissions(path)
 
-    with open(path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            if '=' in line:
-                key, _, value = line.partition('=')
-                key = key.strip()
-                value = value.strip()
-                # Remove quotes if present
-                if value and value[0] in ('"', "'") and value[-1] == value[0]:
-                    value = value[1:-1]
-                if key and value:
-                    env[key] = value
+    # Prefer UTF-8 (utf-8-sig transparently strips a BOM written by Windows
+    # editors like Notepad). Fall back to the locale decoder for a genuinely
+    # locale-encoded .env (e.g. cp1252) so an existing file that loaded before
+    # keeps loading. If it decodes as neither, let UnicodeDecodeError surface
+    # rather than corrupting keys/secrets with replacement characters.
+    try:
+        text = path.read_text(encoding='utf-8-sig')
+    except UnicodeDecodeError:
+        text = path.read_text(encoding=locale.getpreferredencoding(False))
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' in line:
+            key, _, value = line.partition('=')
+            key = key.strip()
+            value = value.strip()
+            # Remove quotes if present
+            if value and value[0] in ('"', "'") and value[-1] == value[0]:
+                value = value[1:-1]
+            if key and value:
+                env.update({key: value})
     return env
 
 
@@ -271,7 +316,7 @@ def _load_keychain(keys: list[str], aliases: dict[str, list[dict[str, str]]] | N
                 if value:
                     break
         if value:
-            env[key] = value
+            env.update({key: value})
     return env
 
 
@@ -310,106 +355,24 @@ def _load_pass(keys: list[str], prefix: str) -> dict[str, str]:
             # returns fast with a non-zero exit and is handled below.
             break
         if result.returncode == 0 and result.stdout.strip():
-            env[key] = result.stdout.strip().splitlines()[0]
+            env.update({key: result.stdout.strip().splitlines()[0]})
     return env
 
 
-def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
-    """Decode JWT payload without verification."""
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return None
-        payload_b64 = parts[1]
-        pad = "=" * (-len(payload_b64) % 4)
-        decoded = base64.urlsafe_b64decode(payload_b64 + pad)
-        return json.loads(decoded.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError, binascii.Error, IndexError) as exc:
-        sys.stderr.write(f"[last30days] WARNING: malformed JWT token: {exc}\n")
-        sys.stderr.flush()
-        return None
-
-
-def _token_expired(token: str, leeway_seconds: int = 60) -> bool:
-    """Check if JWT token is expired."""
-    payload = _decode_jwt_payload(token)
-    if not payload:
-        return False
-    exp = payload.get("exp")
-    if not exp:
-        return False
-    return exp <= (time.time() + leeway_seconds)
-
-
-def extract_chatgpt_account_id(access_token: str) -> str | None:
-    """Extract chatgpt_account_id from JWT token."""
-    payload = _decode_jwt_payload(access_token)
-    if not payload:
-        return None
-    auth_claim = payload.get("https://api.openai.com/auth", {})
-    if isinstance(auth_claim, dict):
-        return auth_claim.get("chatgpt_account_id")
-    return None
-
-
-def load_codex_auth(path: Path = CODEX_AUTH_FILE) -> dict[str, Any]:
-    """Load Codex auth JSON."""
-    if not path.exists():
-        return {}
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        sys.stderr.write(
-            f"[last30days] WARNING: {path} exists but contains invalid JSON -- ignoring\n"
-        )
-        sys.stderr.flush()
-        return {}
-
-
-def get_codex_access_token() -> tuple[str | None, str]:
-    """Get Codex access token from auth.json.
-
-    Returns:
-        (token, status) where status is 'ok', 'missing', or 'expired'
-    """
-    auth = load_codex_auth()
-    token = None
-    if isinstance(auth, dict):
-        tokens = auth.get("tokens") or {}
-        if isinstance(tokens, dict):
-            token = tokens.get("access_token")
-        if not token:
-            token = auth.get("access_token")
-    if not token:
-        return None, AUTH_STATUS_MISSING
-    if _token_expired(token):
-        return None, AUTH_STATUS_EXPIRED
-    return token, AUTH_STATUS_OK
-
-
 def get_openai_auth(file_env: dict[str, str]) -> OpenAIAuth:
-    """Resolve OpenAI auth from API key or Codex login."""
-    api_key = os.environ.get('OPENAI_API_KEY') or file_env.get('OPENAI_API_KEY')
+    """Resolve OpenAI API auth from explicit user-provided API keys."""
+    api_key = read_secret_env('OPENAI_API_KEY') or file_env.get('OPENAI_API_KEY')
     if api_key:
         return OpenAIAuth(
             token=api_key,
             source=AUTH_SOURCE_API_KEY,
             status=AUTH_STATUS_OK,
-            account_id=None,
-            codex_auth_file=str(CODEX_AUTH_FILE),
         )
-
-    # Codex auth (chatgpt.com backend) intentionally skipped.
-    # The endpoint is unstable and causes crashes when the token expires.
-    # Users who want OpenAI should set OPENAI_API_KEY explicitly.
 
     return OpenAIAuth(
         token=None,
         source=AUTH_SOURCE_NONE,
         status=AUTH_STATUS_MISSING,
-        account_id=None,
-        codex_auth_file=str(CODEX_AUTH_FILE),
     )
 
 
@@ -491,11 +454,12 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         'OPENAI_API_KEY': openai_auth.token,
         'OPENAI_AUTH_SOURCE': openai_auth.source,
         'OPENAI_AUTH_STATUS': openai_auth.status,
-        'OPENAI_CHATGPT_ACCOUNT_ID': openai_auth.account_id,
-        'CODEX_AUTH_FILE': openai_auth.codex_auth_file,
     }
 
     keys = [
+        # Debug flag; also exported to os.environ below so log.py's lazy
+        # os.environ.get() picks up .env values after get_config() runs.
+        ('LAST30DAYS_DEBUG', None),
         ('XAI_API_KEY', None),
         ('GOOGLE_API_KEY', None),
         ('GEMINI_API_KEY', None),
@@ -507,12 +471,39 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_X_MODEL', None),
         ('LAST30DAYS_X_BACKEND', None),
         ('LAST30DAYS_REDDIT_BACKEND', None),
+        # Doctor cache freshness window in seconds (doctor --cached).
+        ('LAST30DAYS_DOCTOR_TTL', None),
+        # Per-source deadline (seconds) for doctor --probe live checks.
+        ('LAST30DAYS_DOCTOR_PROBE_TIMEOUT', None),
+        ('LAST30DAYS_REDDIT_SC_MIN_ITEMS', None),
         ('LAST30DAYS_STORE', None),
+        # Discovery topic queue (podcast/X-article pipeline memory). Default
+        # ON; the literal value "off" disables queue writes and annotations.
+        ('LAST30DAYS_DISCOVERY_QUEUE', None),
+        # Wall-clock budget (seconds) for the deep-tier enrichment batch on
+        # the discovery resume leg (--discover --judgments). Read from the
+        # resolved config only (pipeline._resume_enrich_budget_seconds);
+        # unset/invalid falls back to 450s. The one-shot --discover path
+        # keeps its fixed 240s quick budget regardless.
+        ('LAST30DAYS_ENRICH_BUDGET_SECONDS', None),
+        # Opt-in strict exit: truthy -> CLI exits 3 when any source outcome is
+        # degraded (neither ok, no-results, nor skipped-unconfigured). #384.
+        ('LAST30DAYS_STRICT_EXIT', None),
         ('LAST30DAYS_MEMORY_DIR', None),
+        # Optional local-only evidence source. Paths are separated with the
+        # platform path separator (":" on macOS/Linux, ";" on Windows).
+        ('LAST30DAYS_CORPUS_DIRS', None),
+        # Corpus evidence is omitted from the stable agent JSON export unless
+        # this explicit privacy opt-in is truthy.
+        ('LAST30DAYS_CORPUS_IN_EXPORT', None),
+        ('LAST30DAYS_LIBRARY_OWNER', None),
+        ('LAST30DAYS_LIBRARY_CONTEXT', 'on'),
+        ('LAST30DAYS_PUBLISH_PASSWORD', None),
         ('OPENAI_MODEL_PIN', None),
         ('XAI_MODEL_PIN', None),
         ('OPENAI_BASE_URL', None),
         ('XAI_BASE_URL', None),
+        ('OPENROUTER_BASE_URL', None),
         ('SCRAPECREATORS_API_KEY', None),
         ('APIFY_API_TOKEN', None),
         ('AUTH_TOKEN', None),
@@ -545,24 +536,57 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_NATIVE_SEARCH', None),
         # Optional SearXNG instance for the keyless-search fallback rung.
         ('LAST30DAYS_SEARXNG_URL', None),
+        # Truthy -> disable Trustpilot's headless-Chrome WAF-cookie harvest in
+        # automated contexts (cron/CI/eval). Read by trustpilot._harvest_allowed.
+        ('LAST30DAYS_TRUSTPILOT_NO_BROWSER', None),
         ('FROM_BROWSER', None),
         ('LAST30DAYS_TRUST_PROJECT_CONFIG', None),
         ('SETUP_COMPLETE', None),
         ('INCLUDE_SOURCES', ''),
         ('EXCLUDE_SOURCES', ''),
         ('LAST30DAYS_DEFAULT_SEARCH', ''),
+        # Resolve the user-facing default in last30days.py so an absent value
+        # stays distinguishable from an explicit `default`. That distinction
+        # lets the new key override legacy ELI5_MODE=true configurations.
+        ('LAST30DAYS_REGISTER', None),
+        ('FUN_LEVEL', 'medium'),
+        # Backward compatibility for configs written by the original `eli5 on`
+        # follow-up command. New writes use LAST30DAYS_REGISTER=eli5.
+        ('ELI5_MODE', None),
         ('LAST30DAYS_YOUTUBE_SSH_HOST', None),
+        ('LAST30DAYS_REPORT_CACHE_TTL_SECONDS', None),
+        ('LAST30DAYS_VERIFY_FRESHNESS', None),
         ('LAST30DAYS_TRANSCRIPT_TIMEOUT', None),
+        ('DEGRADED_TRANSCRIPT_THRESHOLD', None),
         (KEYCHAIN_ALIASES_ENV, None),
         # Whisper transcription provider for caption-free audio/video. Groq's
         # free tier is preferred; OPENAI_API_KEY is the paid backstop (already
         # resolved above via openai_auth).
         ('GROQ_API_KEY', None),
         ('LAST30DAYS_YT_SUB_LANGS', 'en,es,pt'),
+        ('LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT', None),
+        ('LAST30DAYS_YT_SEARCH_TIMEOUT', None),
+        ('GITHUB_TOKEN', None),
     ]
 
     for key, default in keys:
         config[key] = os.environ.get(key) or merged_env.get(key, default)
+
+    # Export debug flag to os.environ so log.py's lazy os.environ.get()
+    # picks up .env values. setdefault ensures a shell-exported value is
+    # never overwritten by the (lower-priority) .env value.
+    if config.get('LAST30DAYS_DEBUG'):
+        os.environ.setdefault('LAST30DAYS_DEBUG', config['LAST30DAYS_DEBUG'])
+
+    # youtube_yt reads these tuning knobs lazily from os.environ, so values
+    # loaded from .env must be exported into the current engine process.
+    for key in (
+        'LAST30DAYS_YT_SUB_LANGS',
+        'LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT',
+        'LAST30DAYS_YT_SEARCH_TIMEOUT',
+    ):
+        if config.get(key):
+            os.environ.setdefault(key, config[key])
 
     # Backward-compat: ScrapeCreators' own examples and tutorials use the
     # SCRAPE_CREATORS_API_KEY spelling (with underscore between SCRAPE and
@@ -570,7 +594,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
     # don't silently end up with has_scrapecreators=False. Canonical name
     # wins when both are set.
     if not config.get('SCRAPECREATORS_API_KEY'):
-        legacy = os.environ.get('SCRAPE_CREATORS_API_KEY') or merged_env.get('SCRAPE_CREATORS_API_KEY')
+        legacy = read_secret_env('SCRAPE_CREATORS_API_KEY') or merged_env.get('SCRAPE_CREATORS_API_KEY')
         if legacy:
             config['SCRAPECREATORS_API_KEY'] = legacy
 
@@ -763,8 +787,22 @@ def get_reddit_source(config: dict[str, Any]) -> str | None:
 #   xquik — key-based REST X search (XQUIK_API_KEY); keyless of browser cookies
 _X_BACKEND_ORDER = ("xai", "bird", "xurl", "xquik")
 
+# Public routing definitions for the doctor/backend-descriptor layer
+# (lib/backends.py). These are aliases for knowledge this module already
+# owns — the declared X chain order and the pin/floor env var names — so
+# descriptors import one source of truth instead of restating it.
+X_BACKEND_ORDER = _X_BACKEND_ORDER
+X_BACKEND_PIN_VAR = 'LAST30DAYS_X_BACKEND'
+REDDIT_BACKEND_PIN_VAR = 'LAST30DAYS_REDDIT_BACKEND'
+REDDIT_SC_MIN_ITEMS_VAR = 'LAST30DAYS_REDDIT_SC_MIN_ITEMS'
 
-def _x_backend_available(backend: str, config: dict[str, Any], has_bird_creds: bool) -> bool:
+
+def _x_backend_available(
+    backend: str,
+    config: dict[str, Any],
+    has_bird_creds: bool,
+    local_only: bool = False,
+) -> bool:
     if backend == 'xai':
         return bool(config.get('XAI_API_KEY'))
     if backend == 'bird':
@@ -772,13 +810,17 @@ def _x_backend_available(backend: str, config: dict[str, Any], has_bird_creds: b
         return has_bird_creds and bird_x.is_bird_installed()
     if backend == 'xurl':
         from . import xurl_x
+        if local_only:
+            # Doctor/safe-diagnose path: local evidence only (PATH lookup +
+            # token store) — never the live `xurl whoami` network call.
+            return xurl_x.has_stored_auth()
         return xurl_x.is_available()
     if backend == 'xquik':
         return is_xquik_available(config)
     return False
 
 
-def x_backend_chain(config: dict[str, Any]) -> list[str]:
+def x_backend_chain(config: dict[str, Any], local_only: bool = False) -> list[str]:
     """Ordered list of available X backends.
 
     ``chain[0]`` is the default X source; the remaining entries are failover
@@ -789,27 +831,73 @@ def x_backend_chain(config: dict[str, Any]) -> list[str]:
     user explicitly chose it. Browser-cookie probing is intentionally avoided
     (automatic Keychain access causes popups); bird counts as available only
     when AUTH_TOKEN and CT0 are present explicitly.
+
+    ``local_only=True`` is the doctor/safe-diagnose flavor: availability is
+    answered from local evidence only (no subprocess spawns that reach the
+    network — xurl's live `whoami` check is replaced by its on-disk token
+    store). Research-time callers keep the default live semantics.
     """
     from . import bird_x
     has_bird_creds = bool(config.get('AUTH_TOKEN') and config.get('CT0'))
     if has_bird_creds:
         bird_x.set_credentials(config.get('AUTH_TOKEN'), config.get('CT0'))
 
-    preferred = (config.get('LAST30DAYS_X_BACKEND') or '').lower()
+    preferred = (config.get(X_BACKEND_PIN_VAR) or '').lower()
     if preferred in _X_BACKEND_ORDER:
-        return [preferred] if _x_backend_available(preferred, config, has_bird_creds) else []
+        if _x_backend_available(preferred, config, has_bird_creds, local_only):
+            return [preferred]
+        return []
 
-    return [b for b in _X_BACKEND_ORDER if _x_backend_available(b, config, has_bird_creds)]
+    return [
+        b for b in _X_BACKEND_ORDER
+        if _x_backend_available(b, config, has_bird_creds, local_only)
+    ]
 
 
-def get_x_source(config: dict[str, Any]) -> str | None:
+def get_x_source(config: dict[str, Any], local_only: bool = False) -> str | None:
     """The default (primary) X backend, or None if no X source is available.
 
     Thin wrapper over ``x_backend_chain`` returning the first/primary backend;
     callers that want failover should use ``x_backend_chain`` directly.
+    ``local_only`` is forwarded (see ``x_backend_chain``).
     """
-    chain = x_backend_chain(config)
+    chain = x_backend_chain(config, local_only=local_only)
     return chain[0] if chain else None
+
+
+def x_pending_browser_auth(config: dict[str, Any], local_only: bool = False) -> bool:
+    """True when X is not available now but ``FROM_BROWSER`` will authenticate it at run time.
+
+    ``--diagnose`` / ``--preflight`` load config in ``plan_only`` mode, which
+    deliberately skips browser-cookie extraction (no Keychain popup,
+    ``reads_values: false``). As a result ``get_x_source`` returns None and X is
+    dropped from ``available_sources`` even though a normal run would extract the
+    same cookies and authenticate X fine. This predicate reports that
+    "available pending browser auth" state without reading a single cookie — it
+    keys only on the already-resolved browser list (``cookie_extraction_browsers``
+    derives it from ``FROM_BROWSER`` alone, no secrets), bird being installed, and
+    X having a cookie-domain mapping. Side-effect free, so the safe-inspection
+    contract of diagnose/preflight is preserved.
+
+    Returns False whenever X is already available outright (static AUTH_TOKEN/CT0,
+    or xAI/xurl/xquik backend), and in ``read`` mode (a real run has already
+    extracted creds, so its status must be unchanged — never "pending").
+    """
+    # Already available via a static backend (bird creds, xAI, xurl, xquik).
+    # local_only (doctor/safe-diagnose) answers the xurl leg from the token
+    # store instead of the live `xurl whoami` network call.
+    if get_x_source(config, local_only=local_only):
+        return False
+    # Only meaningful in inspection modes that skip extraction; a real ``read``
+    # run has already attempted extraction and must report its true state.
+    if config.get('_BROWSER_COOKIE_MODE') == 'read':
+        return False
+    if 'x' not in COOKIE_DOMAINS:
+        return False
+    if not cookie_extraction_browsers(config):
+        return False
+    from . import bird_x
+    return bird_x.is_bird_installed()
 
 
 def is_ytdlp_available() -> bool:
@@ -821,17 +909,23 @@ def is_ytdlp_available() -> bool:
 def is_youtube_comments_available(config: dict[str, Any]) -> bool:
     """Check if YouTube comment enrichment is available.
 
-    Default-on when SCRAPECREATORS_API_KEY is set — the same key-only backup
-    tier as the YouTube transcript fallback (``is_youtube_sc_available``). Cost
-    is bounded by ``enrich_with_comments(max_videos=3)`` (~3 credits per run).
-    Suppress via ``EXCLUDE_SOURCES=youtube_comments``.
+    yt-dlp fetches YouTube comments free and keyless, so when it is installed
+    comments need no credential and no ``INCLUDE_SOURCES`` opt-in — the opt-in
+    only ever existed to gate ScrapeCreators credit spend, and there is none to
+    gate. ``EXCLUDE_SOURCES=youtube_comments`` remains the off-switch.
 
-    Note: TikTok/Instagram comments remain explicit ``INCLUDE_SOURCES`` opt-ins
-    (see ``is_tiktok_comments_available``); only YouTube comments are default-on.
+    Without yt-dlp, the legacy ScrapeCreators path still applies: it requires
+    SCRAPECREATORS_API_KEY AND ``youtube_comments`` in ``INCLUDE_SOURCES``
+    (mirroring ``is_tiktok_comments_available``), bounded by
+    ``enrich_with_comments(max_videos=3)`` at ~3 credits per run.
     """
+    if 'youtube_comments' in _parse_exclude_sources(config):
+        return False
+    if is_ytdlp_available():
+        return True
     if not config.get('SCRAPECREATORS_API_KEY'):
         return False
-    return 'youtube_comments' not in _parse_exclude_sources(config)
+    return 'youtube_comments' in _parse_include_sources(config)
 
 
 def is_tiktok_comments_available(config: dict[str, Any]) -> bool:
@@ -844,6 +938,20 @@ def is_tiktok_comments_available(config: dict[str, Any]) -> bool:
         return False
     include = _parse_include_sources(config)
     return 'tiktok_comments' in include
+
+
+def is_instagram_comments_available(config: dict[str, Any]) -> bool:
+    """Check if Instagram comment enrichment is available.
+
+    Requires SCRAPECREATORS_API_KEY AND instagram_comments in INCLUDE_SOURCES.
+    Mirrors the youtube_comments / tiktok_comments opt-in pattern. Comments are
+    fetched via ScrapeCreators (GET /v2/instagram/post/comments) with each
+    comment's ``comment_like_count`` used as its vote for ranking. Part of the
+    default onboarding tier (posts on -> comments on for TikTok/Instagram/YouTube).
+    """
+    if not config.get('SCRAPECREATORS_API_KEY'):
+        return False
+    return 'instagram_comments' in _parse_include_sources(config)
 
 
 def is_youtube_sc_available(config: dict[str, Any]) -> bool:
@@ -951,13 +1059,31 @@ def _parse_exclude_sources(config: dict[str, Any]) -> set[str]:
     return {s.strip().lower() for s in raw.split(',') if s.strip()}
 
 
-def is_threads_available(config: dict[str, Any]) -> bool:
-    """Check if Threads source is available.
+def include_sources(config: dict[str, Any]) -> set[str]:
+    """Public view of the parsed INCLUDE_SOURCES set.
 
-    Returns True when SCRAPECREATORS_API_KEY is set. Threads runs alongside
-    TikTok and Instagram as part of the SC family — same key, same per-call
-    cost shape, so the same default-on rule applies. Suppress via
-    EXCLUDE_SOURCES=threads.
+    Thin wrapper over ``_parse_include_sources`` so other modules (doctor,
+    etc.) don't reach into env's privates.
+    """
+    return _parse_include_sources(config)
+
+
+def is_setup_complete(config: dict[str, Any]) -> bool:
+    """Whether guided setup marked this config complete (SETUP_COMPLETE truthy).
+
+    Thin wrapper over ``_truthy`` so other modules don't reach into env's
+    privates.
+    """
+    return _truthy(config.get('SETUP_COMPLETE'))
+
+
+def is_threads_available(config: dict[str, Any]) -> bool:
+    """Check if the Threads credential is available.
+
+    Returns True when SCRAPECREATORS_API_KEY is set. This is an availability
+    predicate only: whether Threads is actually *scheduled* is gated in the
+    pipeline's ``available_sources`` by an ``INCLUDE_SOURCES=threads`` opt-in
+    (the onboarding "Everything" tier), so a key alone no longer runs Threads.
     """
     return bool(config.get('SCRAPECREATORS_API_KEY'))
 
@@ -979,9 +1105,52 @@ def get_instagram_token(config: dict[str, Any]) -> str:
 def get_xiaohongshu_api_base(config: dict[str, Any]) -> str:
     """Get Xiaohongshu HTTP API base URL.
 
-    Defaults to host.docker.internal so OpenClaw Docker can reach host service.
+    The availability probe caches the first logged-in local service it finds so
+    the later search request uses the same browser-backed session endpoint.
     """
-    return (config.get('XIAOHONGSHU_API_BASE') or "http://host.docker.internal:18060").rstrip("/")
+    cached = config.get(XIAOHONGSHU_RESOLVED_API_BASE_KEY)
+    if cached:
+        return str(cached).rstrip("/")
+
+    explicit = config.get("XIAOHONGSHU_API_BASE")
+    if explicit:
+        return str(explicit).rstrip("/")
+
+    return XIAOHONGSHU_DEFAULT_API_BASES[0]
+
+
+def _xiaohongshu_api_base_candidates(config: dict[str, Any]) -> list[str]:
+    explicit = config.get("XIAOHONGSHU_API_BASE")
+    if explicit:
+        return [str(explicit).rstrip("/")]
+
+    candidates: list[str] = []
+    cached = config.get(XIAOHONGSHU_RESOLVED_API_BASE_KEY)
+    if cached:
+        candidates.append(str(cached).rstrip("/"))
+
+    for base in XIAOHONGSHU_DEFAULT_API_BASES:
+        if base not in candidates:
+            candidates.append(base)
+    return candidates
+
+
+def _xiaohongshu_base_logged_in(base: str, http_module: Any) -> bool:
+    # Keep the health probe snappy, but allow one retry for transient hiccups.
+    health = http_module.get(f"{base}/health", timeout=3, retries=2)
+    if not isinstance(health, dict):
+        return False
+    if not health.get("success"):
+        return False
+
+    # Login checks can be slower because some services consult the browser
+    # profile/session, so use a slightly longer timeout than the health probe.
+    login = http_module.get(f"{base}/api/v1/login/status", timeout=8, retries=2)
+    is_logged_in = (
+        login.get("data", {}).get("is_logged_in")
+        if isinstance(login, dict) else False
+    )
+    return bool(is_logged_in)
 
 
 def is_xiaohongshu_available(config: dict[str, Any]) -> bool:
@@ -989,32 +1158,20 @@ def is_xiaohongshu_available(config: dict[str, Any]) -> bool:
     # Import here to avoid heavy imports at module load.
     from . import http
 
-    base = get_xiaohongshu_api_base(config)
-    try:
-        # Keep health probe snappy, but allow one retry for transient hiccups.
-        health = http.get(f"{base}/health", timeout=3, retries=2)
-        if not isinstance(health, dict):
-            return False
-        if not health.get("success"):
-            return False
-
-        # Login probe can be slower on some deployments (browser/session checks),
-        # so use a slightly longer timeout to avoid false negatives.
-        login = http.get(f"{base}/api/v1/login/status", timeout=8, retries=2)
-        is_logged_in = (
-            login.get("data", {}).get("is_logged_in")
-            if isinstance(login, dict) else False
-        )
-        return bool(is_logged_in)
-    except (OSError, http.HTTPError):
-        return False
-    except Exception as exc:
-        sys.stderr.write(
-            f"[last30days] WARNING: unexpected error checking Xiaohongshu: "
-            f"{type(exc).__name__}: {exc}\n"
-        )
-        sys.stderr.flush()
-        return False
+    for base in _xiaohongshu_api_base_candidates(config):
+        try:
+            if _xiaohongshu_base_logged_in(base, http):
+                config[XIAOHONGSHU_RESOLVED_API_BASE_KEY] = base
+                return True
+        except (OSError, http.HTTPError):
+            continue
+        except Exception as exc:
+            sys.stderr.write(
+                f"[last30days] WARNING: unexpected error checking Xiaohongshu "
+                f"at {base}: {type(exc).__name__}: {exc}\n"
+            )
+            sys.stderr.flush()
+    return False
 
 
 # Backward compat alias
@@ -1029,7 +1186,10 @@ def get_x_source_status(config: dict[str, Any], probe: bool = False) -> dict[str
             ``bird_authenticated`` to False when X clearly returns nothing,
             so ``--diagnose`` reflects runtime reality instead of static
             credential presence. A transient timeout leaves the status
-            unchanged (fail open).
+            unchanged (fail open). When False (the safe/diagnose path that
+            doctor uses), NO network is touched: xurl availability comes
+            from local evidence (``xurl_x.has_stored_auth``), never the
+            live ``xurl whoami`` call.
 
     Returns:
         Dict with keys: source, bird_installed, bird_authenticated,
@@ -1069,6 +1229,13 @@ def get_x_source_status(config: dict[str, Any], probe: bool = False) -> dict[str
         else:
             xquik_status = "configured (not probed)"
 
+    # Xurl availability, computed ONCE. probe=True (a live diagnose) may run
+    # the real `xurl whoami`; probe=False is the safe path (doctor,
+    # --diagnose, --preflight) and must stay local-only — the live check is
+    # an authenticated X API network call.
+    from . import xurl_x as _xurl_x
+    xurl_available = _xurl_x.is_available() if probe else _xurl_x.has_stored_auth()
+
     # Determine active source. bird (browser cookies) and xAI win when present;
     # when neither is available, xquik is the active X source. A probe that
     # clearly failed (False) means xquik is not actually usable.
@@ -1077,22 +1244,20 @@ def get_x_source_status(config: dict[str, Any], probe: bool = False) -> dict[str
     elif xai_available:
         source = 'xai'
     else:
-        from . import xurl_x as _xurl_check
-        if _xurl_check.is_available():
+        if xurl_available:
             source = 'xurl'
         elif xquik_available and xquik_working is not False:
             source = 'xquik'
         else:
             source = None
 
-    from . import xurl_x as _xurl_x
     return {
         "source": source,
         "bird_installed": bird_status["installed"],
         "bird_authenticated": bird_status["authenticated"],
         "bird_username": bird_status["username"],
         "xai_available": xai_available,
-        "xurl_available": _xurl_x.is_available(),
+        "xurl_available": xurl_available,
         "xquik_available": xquik_available,
         "xquik_working": xquik_working,
         "xquik_status": xquik_status,

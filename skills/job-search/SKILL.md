@@ -16,8 +16,17 @@ Self-hosted job tracker. REST, JSON in/out, no auth.
 
 - `POST /pipeline/sync` — poll watched boards + HN + X. → counts.
 - `POST /pipeline/discover` — web-search new Canada-eligible postings. → `{added,dropped}`.
-- `POST /jobs/quick-add {"url"}` — add one posting. If url is an ATS board/posting (Greenhouse/Lever/Ashby/Workable), **harvests the whole board AND watches it**.
+- `POST /jobs {company,title,posted_at,...}` — add one posting you've **already researched** (you have the fields). Stores your metadata as-is and, if `url`/`source_id` resolves to an ATS board, **links the company to that board and watches it** (first add only; aggregators skipped). This is the scan path.
+- `POST /jobs/quick-add {"url"}` — add by URL when you have **only a link**; the server fetches + extracts it. If url is an ATS board/posting (Greenhouse/Lever/Ashby/Workable), **harvests the whole board AND watches it**.
 - `POST /pipeline/tick` — one full background pass (sync+enrich+extract+fit).
+
+**Adding from web/Exa search:** prefer the **canonical** posting URL (the company's
+own ATS/careers page), NOT an aggregator/listing link (talent.com, himalayas,
+remotive, builtin, linkedin, indeed, bebee, …). Aggregator URLs are accepted but
+flagged `url_status='aggregator'` and auto-resolved server-side (web-search by
+company+title → real posting) on the next enrich pass — so always pass an accurate
+`company` and role `title`; resolution keys off them. Unresolvable ones end
+`url_status='unresolved'` (visible badge, skipped by autofill).
 
 ## watch a job board / company
 
